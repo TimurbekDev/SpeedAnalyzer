@@ -1,0 +1,56 @@
+"""Settings panel — visualization, BG subtractor, speed, stabilization."""
+
+import tkinter as tk
+from ui.theme.dark import Theme
+from ui.widgets.components import section_label, divider, param_row, toggle_row
+
+
+class SettingsPanel(tk.Frame):
+    def __init__(self, parent, app, **kwargs):
+        super().__init__(parent, bg=Theme.BG, **kwargs)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        section_label(self, "SETTINGS")
+
+        body = tk.Frame(self, bg=Theme.BG)
+        body.pack(fill="both", expand=True, padx=10)
+
+        left  = tk.Frame(body, bg=Theme.BG)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right = tk.Frame(body, bg=Theme.BG)
+        right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+
+        self._card(left, "VISUALIZATION", toggles=[
+            ("Show Bounding Boxes", self.app.var_boxes),
+            ("Show Speed Labels",   self.app.var_speed_lbl),
+            ("Show Motion Trails",  self.app.var_trail),
+        ])
+
+        self._card(left, "BG SUBTRACTOR", params=[
+            ("Min Area (px²)", self.app.var_min_a),
+            ("Max Area (px²)", self.app.var_max_a),
+        ])
+
+        self._card(right, "SPEED CONTROL", params=[
+            ("Speed Limit (km/h)", self.app.var_limit),
+            ("Speed Multiplier",   self.app.var_speed_mul),
+            ("Calibration Factor", self.app.var_speed_k),
+        ])
+
+        self._card(right, "STABILIZATION", toggles=[
+            ("Enable Stabilization", self.app.var_stab),
+            ("Stabilize Viewport",   self.app.var_stabview),
+        ])
+
+    def _card(self, parent, title, toggles=None, params=None):
+        card = tk.Frame(parent, bg=Theme.SURFACE, padx=14, pady=12)
+        card.pack(fill="x", pady=6)
+        section_label(card, title, bg=Theme.SURFACE)
+        divider(card, bg=Theme.SURFACE)
+        tk.Frame(card, bg=Theme.SURFACE, height=4).pack()
+        for text, var in (toggles or []):
+            toggle_row(card, text, var)
+        for label, var in (params or []):
+            param_row(card, label, var)
