@@ -12,7 +12,9 @@ import os
 from datetime import datetime
 from collections import deque
 
-from config.defaults import CONF_DEFAULT, CAP_Q_SIZE, RES_Q_SIZE
+from config.defaults import (CONF_DEFAULT, CAP_Q_SIZE, RES_Q_SIZE,
+                             PROX_SAFE_DIST_M, PROX_WARN_DIST_M,
+                             PROX_PX_PER_M, PROX_LOG_INTERVAL)
 from core.entities.track import Track
 from vision.detection.loader        import load_yolo
 from vision.detection.bg_detector   import BGDetector
@@ -23,13 +25,18 @@ from vision.geometry.camera_model   import CameraModel
 from vision.geometry.lane_counter   import CrossLine
 from vision.rendering.frame_renderer import draw_tracks, draw_cross_flash
 from vision.pipeline.worker         import Worker
+from vision.proximity import (DistanceCalculator, ProximityAnalytics,
+                               render_proximity_overlay, HeatmapAccumulator,
+                               BirdseyeTransform)
 
 from ui.theme.dark          import Theme
 from ui.widgets.components  import TopBar, SidebarNav, PlaybackBar, ToastManager
 from ui.dialogs.calibrator  import CalibratorWindow
+from ui.dialogs.birdseye_dialog import BirdseyeDialog
 from ui.panels.dashboard    import DashboardPanel
 from ui.panels.detection    import DetectionPanel
 from ui.panels.analytics    import AnalyticsPanel
+from ui.panels.proximity_panel import ProximityPanel
 from ui.panels.settings_panel import SettingsPanel
 from ui.panels.export_panel import ExportPanel
 
@@ -87,6 +94,20 @@ class SpeedAnalyzerModern:
         self._line_tmp: list | None = None
         self._cross_flash: dict = {}
 
+        # Proximity zone (second drawable zone for distance analytics)
+        self._prox_zone:        list              = []
+        self._drawing_prox:     bool              = False
+        self._prox_tmp:         list | None       = None
+        self._prox_zone_mask:   np.ndarray | None = None
+        self._prox_zone_area_m2: float            = 5000.0
+        self._last_prox_snap:   dict              = {
+            "pairs": [], "count": 0, "min_m": 0.0,
+            "max_m": 0.0, "avg_m": 0.0, "congestion": 0.0, "density": 0.0,
+        }
+        self._prox_refresh_t:   float = 0.0
+        self._prox_log:         list  = []
+        self._prox_log_counter: int   = 0
+
         self._stab_dx = self._stab_dy = 0.0
         self._violations = 0
         self._total      = 0
@@ -110,6 +131,15 @@ class SpeedAnalyzerModern:
         self.var_conf      = tk.DoubleVar(value=CONF_DEFAULT)
         self.var_lane_hw   = tk.IntVar(value=CrossLine.DEFAULT_HW)
 
+        # Proximity analytics controls
+        self.var_safe_dist    = tk.DoubleVar(value=PROX_SAFE_DIST_M)
+        self.var_warn_dist    = tk.DoubleVar(value=PROX_WARN_DIST_M)
+        self.var_prox_px_m    = tk.DoubleVar(value=PROX_PX_PER_M)
+        self.var_show_dist    = tk.BooleanVar(value=True)
+        self.var_show_labels  = tk.BooleanVar(value=True)
+        self.var_show_heatmap = tk.BooleanVar(value=False)
+        self.var_use_birdseye = tk.BooleanVar(value=False)
+
     def _load_backend(self):
         self.yolo_det, self.model_name = load_yolo()
         self.bg_det    = BGDetector()
@@ -117,6 +147,11 @@ class SpeedAnalyzerModern:
         self.stabilizer = VideoStabilizer()
         self.cam       = CameraModel()
         self.tracker   = Tracker(30.0, self.cam)
+        self.prox_calc      = DistanceCalculator(px_per_m=PROX_PX_PER_M)
+        self.prox_analytics = ProximityAnalytics(
+            safe_m=PROX_SAFE_DIST_M, warn_m=PROX_WARN_DIST_M)
+        self.birdseye  = BirdseyeTransform()
+        self.heatmap   = HeatmapAccumulator()
 
     def reload_yolo(self, model_name: str):
         """Load a different YOLO model (e.g. 'yolov8s', 'yolov8m')."""
@@ -161,6 +196,7 @@ class SpeedAnalyzerModern:
             "dashboard": DashboardPanel(self.content, self),
             "detection": DetectionPanel(self.content, self),
             "analytics": AnalyticsPanel(self.content, self),
+            "proximity": ProximityPanel(self.content, self),
             "settings":  SettingsPanel(self.content, self),
             "export":    ExportPanel(self.content, self),
         }
@@ -223,6 +259,9 @@ class SpeedAnalyzerModern:
         self.results   = []; self.recorded_ids = set(); self._cross_flash = {}
         self.roi       = []; self._roi_mask = None
         self._total    = 0;  self._violations = 0
+        self._prox_zone = []; self._prox_zone_mask = None
+        self._prox_log  = []; self._prox_log_counter = 0
+        self.prox_analytics.reset(); self.heatmap.reset()
         self._panels["dashboard"].chart.reset()
         ok, f = self.cap.read()
         if ok:
@@ -259,7 +298,11 @@ class SpeedAnalyzerModern:
         self.bg_det = BGDetector(self.var_min_a.get(), self.var_max_a.get())
         self.worker = Worker(self.yolo_det, self.bg_det, self.enhancer,
                              self.tracker, self.in_q, self.out_q,
-                             cross_line=self.cross_line)
+                             cross_line=self.cross_line,
+                             prox_zone=self._prox_zone_mask,
+                             prox_calc=self.prox_calc,
+                             prox_analytics=self.prox_analytics,
+                             prox_area_m2=self._prox_zone_area_m2)
         if self._roi_mask is not None:
             self.worker.set_roi(self._roi_mask)
         self.worker.start()
@@ -334,6 +377,33 @@ class SpeedAnalyzerModern:
         if latest_frame is not None:
             self._last_frame  = latest_frame
             self._last_tracks = latest_tracks
+
+            # Heatmap update (all tracks, every frame, main thread only)
+            if self._last_tracks:
+                fh, fw = self._last_frame.shape[:2]
+                self.heatmap.update(self._last_tracks, fw, fh)
+
+            # Proximity panel refresh at ~5 fps to avoid TK widget churn
+            now_t = time.perf_counter()
+            if now_t - self._prox_refresh_t > 0.20:
+                self._last_prox_snap = self.prox_analytics.snapshot
+                self._panels["proximity"].refresh(self._last_prox_snap)
+                self._prox_refresh_t = now_t
+
+            # Proximity log entry every PROX_LOG_INTERVAL frames
+            self._prox_log_counter += 1
+            if (self._prox_log_counter % PROX_LOG_INTERVAL == 0
+                    and self._last_prox_snap["count"] > 0):
+                entry = {
+                    "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "vehicles":    self._last_prox_snap["count"],
+                    "min_m":       round(self._last_prox_snap["min_m"],  1),
+                    "max_m":       round(self._last_prox_snap["max_m"],  1),
+                    "avg_m":       round(self._last_prox_snap["avg_m"],  1),
+                    "congestion":  round(self._last_prox_snap["congestion"], 1),
+                    "density":     round(self._last_prox_snap["density"],    2),
+                }
+                self._prox_log.append(entry)
 
             if all_crossings:
                 for ev in all_crossings:
@@ -483,6 +553,10 @@ class SpeedAnalyzerModern:
         if self._drawing_roi:
             self.roi.append([vx, vy])
             self._render()
+            return
+        if self._drawing_prox:
+            self._prox_zone.append([vx, vy])
+            self._render()
 
     def _canvas_rclick(self, e):
         if self._drawing_line:
@@ -501,6 +575,25 @@ class SpeedAnalyzerModern:
                 self.worker.set_roi(mask)
             self._render()
             self.toast.show("ROI applied.", "success")
+            return
+        if self._drawing_prox and len(self._prox_zone) >= 3:
+            self._drawing_prox = False
+            self._prox_tmp     = None
+            fh, fw = self._last_frame.shape[:2]
+            mask = np.zeros((fh, fw), np.uint8)
+            cv2.fillPoly(mask, [np.array(self._prox_zone, np.int32)], 255)
+            self._prox_zone_mask = mask
+            # Estimate real-world area from polygon area in px → m²
+            area_px = float(cv2.contourArea(
+                np.array(self._prox_zone, np.int32).reshape(-1, 1, 2)))
+            px_m = max(self.var_prox_px_m.get(), 0.1)
+            self._prox_zone_area_m2 = area_px / (px_m * px_m)
+            if self.worker:
+                self.worker.set_prox_zone(mask, self._prox_zone_area_m2)
+            self._render()
+            self._navigate("proximity")
+            self.toast.show(
+                "Proximity zone set — play video to see analytics.", "success")
 
     def _canvas_motion(self, e):
         if self._last_frame is None:
@@ -512,10 +605,125 @@ class SpeedAnalyzerModern:
         elif self._drawing_roi:
             self._roi_tmp = [vx, vy]
             self._render()
+        elif self._drawing_prox:
+            self._prox_tmp = [vx, vy]
+            self._render()
 
     def _c2v(self, ex: int, ey: int):
         return (max(0, min(int((ex - self.ox) * self.sx), 9999)),
                 max(0, min(int((ey - self.oy) * self.sy), 9999)))
+
+    # ── Proximity zone drawing ────────────────────────────────────────────────
+
+    def _prox_start(self):
+        self._drawing_prox = True
+        self._drawing_roi  = False
+        self._drawing_line = False
+        self._prox_zone    = []
+        self._prox_tmp     = None
+        self.toast.show(
+            "Left-click to add proximity zone points. Right-click to finish.", "info")
+
+    def _clear_prox(self):
+        self._prox_zone      = []
+        self._prox_zone_mask = None
+        self._drawing_prox   = False
+        self._prox_tmp       = None
+        self._last_prox_snap = {
+            "pairs": [], "count": 0, "min_m": 0.0,
+            "max_m": 0.0, "avg_m": 0.0, "congestion": 0.0, "density": 0.0,
+        }
+        self.prox_analytics.reset()
+        if self.worker:
+            self.worker.set_prox_zone(None)
+        if self._last_frame is not None:
+            self._render()
+        self.toast.show("Proximity zone cleared.", "warning")
+
+    # ── Proximity settings ────────────────────────────────────────────────────
+
+    def _apply_prox_settings(self):
+        px_m = max(0.1, self.var_prox_px_m.get())
+        self.prox_calc.px_per_m       = px_m
+        self.prox_analytics.safe_m    = self.var_safe_dist.get()
+        self.prox_analytics.warn_m    = self.var_warn_dist.get()
+        if self.var_use_birdseye.get() and self.birdseye.active:
+            self.prox_calc.set_birdseye(self.birdseye.M,
+                                        self.birdseye.px_per_m_out)
+        else:
+            self.prox_calc.set_birdseye(None, 0.0)
+        # Recompute zone area with new px_m if zone exists
+        if len(self._prox_zone) >= 3:
+            area_px = float(cv2.contourArea(
+                np.array(self._prox_zone, np.int32).reshape(-1, 1, 2)))
+            self._prox_zone_area_m2 = area_px / (px_m * px_m)
+            if self.worker:
+                self.worker.set_prox_zone(self._prox_zone_mask,
+                                          self._prox_zone_area_m2)
+        self.toast.show("Proximity settings applied.", "success")
+
+    # ── Bird's-eye calibration ────────────────────────────────────────────────
+
+    def _open_birdseye_calib(self):
+        if self._last_frame is None:
+            self.toast.show("Open a video file first.", "warning")
+            return
+        BirdseyeDialog(self.root, self._last_frame,
+                       callback=self._on_birdseye_calibrated)
+
+    def _on_birdseye_calibrated(self, src_pts, width_m: float, height_m: float):
+        self.birdseye.calibrate(src_pts, width_m, height_m)
+        self.var_use_birdseye.set(True)
+        self._apply_prox_settings()
+        self.toast.show(
+            f"Bird's-eye calibrated  {width_m}m × {height_m}m", "success")
+
+    # ── Proximity Excel export ────────────────────────────────────────────────
+
+    def _export_proximity_excel(self):
+        if not EXCEL_OK:
+            messagebox.showerror("Error", "openpyxl not installed."); return
+        if not self._prox_log:
+            self.toast.show("No proximity data recorded yet.", "warning"); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile=f"proximity_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+        if not path:
+            return
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Proximity Analytics"
+
+            hdr_fill = PatternFill("solid", fgColor="0D1526")
+            hdr_font = Font(bold=True, color="7C3AED", name="Consolas", size=10)
+            def_font = Font(name="Consolas", size=9)
+            center   = Alignment(horizontal="center")
+            thin     = Side(style="thin", color="1E3A5F")
+            border   = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            headers = ["Timestamp", "Vehicles", "Min Dist (m)",
+                       "Max Dist (m)", "Avg Dist (m)", "Congestion %", "Density"]
+            col_w   = [22, 10, 14, 14, 14, 14, 14]
+            for ci, (h, w) in enumerate(zip(headers, col_w), 1):
+                c = ws.cell(row=1, column=ci, value=h)
+                c.fill = hdr_fill; c.font = hdr_font
+                c.alignment = center; c.border = border
+                ws.column_dimensions[get_column_letter(ci)].width = w
+
+            for ri, row in enumerate(self._prox_log, 2):
+                vals = [row["timestamp"], row["vehicles"],
+                        row["min_m"], row["max_m"], row["avg_m"],
+                        row["congestion"], row["density"]]
+                for ci, val in enumerate(vals, 1):
+                    c = ws.cell(row=ri, column=ci, value=val)
+                    c.font = def_font; c.alignment = center; c.border = border
+
+            wb.save(path)
+            self.toast.show(f"Proximity exported: {os.path.basename(path)}", "success")
+        except Exception as ex:
+            messagebox.showerror("Export Error", str(ex))
 
     def _clear_all(self):
         self._stop_play()
@@ -530,6 +738,16 @@ class SpeedAnalyzerModern:
         self._cross_flash  = {}; self._total = 0; self._violations = 0
         Track._next        = 1
         self._panels["dashboard"].chart.reset()
+        # Proximity reset
+        self._prox_zone    = []; self._prox_zone_mask = None
+        self._drawing_prox = False; self._prox_tmp = None
+        self._prox_log     = []; self._prox_log_counter = 0
+        self.prox_analytics.reset()
+        self.heatmap.reset()
+        self._last_prox_snap = {
+            "pairs": [], "count": 0, "min_m": 0.0,
+            "max_m": 0.0, "avg_m": 0.0, "congestion": 0.0, "density": 0.0,
+        }
         if self._last_frame is not None:
             self._render()
         self.toast.show("All data cleared.", "warning")
@@ -563,6 +781,30 @@ class SpeedAnalyzerModern:
                 cv2.line(d, tuple(self.roi[-1]), tuple(self._roi_tmp),
                          (50, 220, 50), 1)
 
+        # Proximity zone (purple)
+        if len(self._prox_zone) >= 3:
+            ov = d.copy()
+            cv2.fillPoly(ov, [np.array(self._prox_zone, np.int32)], (100, 0, 160))
+            cv2.addWeighted(ov, 0.15, d, 0.85, 0, d)
+            cv2.polylines(d, [np.array(self._prox_zone, np.int32)],
+                          True, (180, 0, 255), 2)
+            cv2.putText(d, "PROX ZONE",
+                        (self._prox_zone[0][0] + 5, self._prox_zone[0][1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 0, 255), 1, cv2.LINE_AA)
+        elif self._prox_zone and self._drawing_prox:
+            for i, pt in enumerate(self._prox_zone):
+                cv2.circle(d, tuple(pt), 5, (180, 0, 255), -1)
+                if i > 0:
+                    cv2.line(d, tuple(self._prox_zone[i-1]), tuple(pt),
+                             (180, 0, 255), 2)
+            if self._prox_tmp:
+                cv2.line(d, tuple(self._prox_zone[-1]), tuple(self._prox_tmp),
+                         (180, 0, 255), 1)
+
+        # Heatmap (all tracks, blended under other overlays)
+        if self.var_show_heatmap.get():
+            self.heatmap.render(d)
+
         self.cross_line.draw(d)
         if self._drawing_line and self._line_p1 and self._line_tmp:
             cv2.line(d, tuple(self._line_p1), tuple(self._line_tmp),
@@ -572,6 +814,16 @@ class SpeedAnalyzerModern:
         draw_tracks(d, self._last_tracks, 1.0,
                     show_boxes=self.var_boxes.get(),
                     show_speed=self.var_speed_lbl.get())
+
+        # Proximity distance lines
+        if self.var_show_dist.get() and self._last_prox_snap["pairs"]:
+            render_proximity_overlay(
+                d,
+                self._last_prox_snap["pairs"],
+                safe_m=self.var_safe_dist.get(),
+                warn_m=self.var_warn_dist.get(),
+                show_labels=self.var_show_labels.get(),
+            )
 
         if self.var_speed_lbl.get() and self._cross_flash:
             now = time.perf_counter()
@@ -584,6 +836,32 @@ class SpeedAnalyzerModern:
                     if self.stabilizer.enabled else "Stab: OFF")
         cv2.putText(d, stab_txt, (8, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 160, 200), 1, cv2.LINE_AA)
+
+        # Proximity zone HUD (always visible on video when zone is set)
+        if self._prox_zone_mask is not None:
+            sn  = self._last_prox_snap
+            cnt = sn.get("count", 0)
+            avg = sn.get("avg_m", 0.0)
+            cng = sn.get("congestion", 0.0)
+            if cnt >= 2:
+                hud_color = (0, 220, 80) if avg >= self.var_safe_dist.get() else \
+                            (0, 200, 240) if avg >= self.var_warn_dist.get() else \
+                            (0, 60, 255)
+            else:
+                hud_color = (180, 0, 255)
+            hud_lines = [
+                f"ZONE  {cnt} veh",
+                f"Avg {avg:.1f}m" if cnt >= 2 else "Need 2+ veh",
+                f"Cong {cng:.0f}%"  if cnt >= 2 else "",
+            ]
+            for i, ln in enumerate(hud_lines):
+                if not ln:
+                    continue
+                yy = 42 + i * 17
+                cv2.putText(d, ln, (8, yy), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.42, (0, 0, 0),   2, cv2.LINE_AA)
+                cv2.putText(d, ln, (8, yy), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.42, hud_color,   1, cv2.LINE_AA)
 
         if nw > 0 and nh > 0:
             disp = cv2.resize(d, (nw, nh), interpolation=cv2.INTER_LINEAR)

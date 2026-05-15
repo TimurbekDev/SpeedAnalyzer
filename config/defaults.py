@@ -28,3 +28,9 @@ TRACKER_MAX_AGE:  int   = 20    # frames before dropping a lost track
 TRACKER_MIN_HITS: int   = 3     # detections before track is reported
 TRACKER_IOU_THR:  float = 0.20  # IoU overlap threshold for matching
 TRACKER_DIST_THR: int   = 120   # centroid distance threshold for matching
+
+# ── Proximity analytics defaults ──────────────────────────────────────────────
+PROX_SAFE_DIST_M:   float = 10.0   # ≥ safe   → green (safe following gap)
+PROX_WARN_DIST_M:   float =  5.0   # ≥ warn   → yellow (marginal gap)
+PROX_PX_PER_M:      float = 20.0   # pixels per metre (flat-ground fallback)
+PROX_LOG_INTERVAL:  int   = 30     # frames between proximity log entries

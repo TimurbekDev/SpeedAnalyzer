@@ -211,6 +211,7 @@ class SidebarNav(tk.Frame):
         ("⬡", "DASH",      "dashboard"),
         ("◈", "DETECT",    "detection"),
         ("◉", "ANALYTICS", "analytics"),
+        ("◎", "PROXIMITY", "proximity"),
         ("⚙", "SETTINGS",  "settings"),
         ("⊞", "EXPORT",    "export"),
     ]
@@ -446,6 +447,14 @@ class PlaybackBar(tk.Frame):
         self.btn_line = GlowButton(right, "— LINE", self.app._line_start,
                                    accent=Theme.WARNING, width=74, height=36)
         self.btn_line.pack(side="right", padx=2)
+
+        tk.Frame(right, bg=Theme.BORDER, width=1).pack(side="right", fill="y", padx=6)
+
+        GlowButton(right, "✕ ZONE", self.app._clear_prox,
+                   accent=Theme.DANGER, width=74, height=36).pack(side="right", padx=2)
+        self.btn_zone = GlowButton(right, "◎ ZONE", self.app._prox_start,
+                                   accent=Theme.PURPLE, width=74, height=36)
+        self.btn_zone.pack(side="right", padx=(0, 2))
 
         tk.Frame(right, bg=Theme.BORDER, width=1).pack(side="right", fill="y", padx=6)
 
