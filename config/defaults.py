@@ -5,7 +5,7 @@ All magic numbers live here — change once, affects the whole app.
 
 # ── YOLO / detection ──────────────────────────────────────────────────────────
 VEHICLE_CLASSES: set  = {2, 5, 7}   # COCO: car=2, bus=5, truck=7
-CONF_DEFAULT:    float = 0.35        # minimum detection confidence
+CONF_DEFAULT:    float = 0.4        # minimum detection confidence
 FRAME_SKIP:      int   = 2           # run YOLO every N frames (1 = every frame)
 
 # ── Thread queue sizes ────────────────────────────────────────────────────────

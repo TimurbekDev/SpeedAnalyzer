@@ -1,6 +1,7 @@
 """Settings panel — visualization, BG subtractor, speed, stabilization."""
 
 import tkinter as tk
+from tkinter import ttk
 from ui.theme.dark import Theme
 from ui.widgets.components import section_label, divider, param_row, toggle_row
 
@@ -33,6 +34,13 @@ class SettingsPanel(tk.Frame):
             ("Max Area (px²)", self.app.var_max_a),
         ])
 
+        self._card(right, "YOLO MODEL", model_selector=[
+            ("yolov8n", "Nano (fastest)"),
+            ("yolov8s", "Small (balanced)"),
+            ("yolov8m", "Medium (accurate)"),
+            ("yolov8l", "Large (very accurate)"),
+        ])
+
         self._card(right, "SPEED CONTROL", params=[
             ("Speed Limit (km/h)", self.app.var_limit),
             ("Speed Multiplier",   self.app.var_speed_mul),
@@ -44,7 +52,7 @@ class SettingsPanel(tk.Frame):
             ("Stabilize Viewport",   self.app.var_stabview),
         ])
 
-    def _card(self, parent, title, toggles=None, params=None):
+    def _card(self, parent, title, toggles=None, params=None, model_selector=None):
         card = tk.Frame(parent, bg=Theme.SURFACE, padx=14, pady=12)
         card.pack(fill="x", pady=6)
         section_label(card, title, bg=Theme.SURFACE)
@@ -54,3 +62,27 @@ class SettingsPanel(tk.Frame):
             toggle_row(card, text, var)
         for label, var in (params or []):
             param_row(card, label, var)
+        if model_selector:
+            self._model_selector(card, model_selector)
+    
+    def _model_selector(self, parent, models):
+        """Dropdown to select YOLO model."""
+        row = tk.Frame(parent, bg=Theme.SURFACE)
+        row.pack(fill="x", pady=4)
+        lbl = tk.Label(row, text="Model:", bg=Theme.SURFACE, fg=Theme.TEXT_1)
+        lbl.pack(side="left", padx=(0, 8))
+        
+        models_dict = {name: model_id for model_id, name in models}
+        current_model = self.app.model_name.replace(".pt", "") if self.app.model_name else "yolov8n"
+        
+        var = tk.StringVar(value=current_model)
+        combo = tk.ttk.Combobox(row, textvariable=var, values=list(models_dict.keys()),
+                                state="readonly", width=25)
+        combo.pack(side="left", fill="x", expand=True)
+        
+        def on_select(event=None):
+            selected = var.get()
+            model_id = models_dict.get(selected, "yolov8n")
+            self.app.reload_yolo(model_id)
+        
+        combo.bind("<<ComboboxSelected>>", on_select)

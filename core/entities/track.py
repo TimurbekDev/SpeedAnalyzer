@@ -119,11 +119,12 @@ class Track:
         self._est      = SpeedEstimator(fps)
         self._est.push(fid, self.cx, self.cy)
         # Line crossing state
-        self.prev_cx   = self.cx
-        self.prev_cy   = self.cy
-        self.line_side = None
-        self.crossed   = False
-        self.cross_dir = None
+        self.prev_cx      = self.cx
+        self.prev_cy      = self.cy
+        self.line_side    = None
+        self.crossed      = False
+        self.cross_dir    = None
+        self.speed_reported = False   # True once speed locked at crossing moment
         # Unique per-track BGR color
         h = (self.id * 47) % 180
         self.color = tuple(int(c) for c in
@@ -147,14 +148,41 @@ class Track:
         self.hits   += 1
         self.last_fid = fid
         self.history.append((fid, self.cx, self.cy))
+        # Feed estimator every frame so crossing speed works even without an ROI.
+        self._est.push(fid, self.cx, self.cy)
 
     def calc_speed(self, cam) -> None:
+        # _est.push() is now done in update(); just run the regression here.
         ref_row = self.cy + self.bbox[3] / 2.0
-        self._est.push(self.last_fid, self.cx, self.cy)
         kmh = self._est.estimate(cam, ref_row)
         self.speed_kmh = kmh
         if kmh > 0:
             self.speed_samples.append(kmh)
+
+    def lock_crossing_speed(self, cam) -> float:
+        """Compute and freeze speed at the moment of line crossing.
+
+        Called once per track when it crosses the counting line.
+        Uses the alpha-beta filtered centroid history already in the estimator.
+        Returns km/h; also updates self.speed_kmh and sets self.speed_reported.
+        """
+        if self.speed_reported:
+            return self.speed_kmh
+        if cam is None:
+            import warnings
+            warnings.warn(f"Track #{self.id}: no CameraModel — crossing speed unavailable",
+                          stacklevel=2)
+            self.speed_reported = True
+            return self.speed_kmh
+        ref_row = self.cy + self.bbox[3] / 2.0
+        kmh = self._est.estimate(cam, ref_row)
+        # Require minimal displacement: at least MIN_PTS frames of data
+        if kmh > 0:
+            self.speed_kmh = kmh
+            if kmh not in self.speed_samples:
+                self.speed_samples.append(kmh)
+        self.speed_reported = True
+        return self.speed_kmh
 
     @property
     def trail(self) -> list:

@@ -78,7 +78,7 @@ class Worker(threading.Thread):
             crossings: list[dict] = []
             if cl and cl.active:
                 for t in self.trk.tracks:
-                    ev = cl.check_track(t, fid)
+                    ev = cl.check_track(t, fid, cam=cam)
                     if ev:
                         crossings.append(ev)
 

@@ -28,8 +28,8 @@ pip install -r requirements.txt
 
 ## Speed analyzer ishga tushirish
 
-Loyiha ildizida mavjud skript bilan ishlang (`speed_analyzer_pro.py` misol):
+Loyiha ildizida mavjud skript bilan ishlang (`main.py` misol):
 
 ```bash
-py speed_analyzer_pro.py 
+py main.py 
 ```

@@ -118,6 +118,18 @@ class SpeedAnalyzerModern:
         self.cam       = CameraModel()
         self.tracker   = Tracker(30.0, self.cam)
 
+    def reload_yolo(self, model_name: str):
+        """Load a different YOLO model (e.g. 'yolov8s', 'yolov8m')."""
+        print(f"[APP] Switching to {model_name}...")
+        det, name = load_yolo(model_name=model_name)
+        if det is None:
+            self.toast.show(f"Failed to load {model_name}", "error")
+            return
+        self.yolo_det = det
+        self.model_name = name
+        self.topbar.update_model_name(name)
+        self.toast.show(f"Switched to {name}", "info")
+
     # ── UI build ──────────────────────────────────────────────────────────────
     def _build_ui(self):
         self.root.title("Speed Analyzer Pro")

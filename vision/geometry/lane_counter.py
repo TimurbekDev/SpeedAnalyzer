@@ -125,7 +125,7 @@ class CrossLine:
 
     # ── Per-track crossing check ───────────────────────────────────────────────
 
-    def check_track(self, track, fid: int) -> dict | None:
+    def check_track(self, track, fid: int, cam=None) -> dict | None:
         """
         Called inside Worker for every active track, every frame.
 
@@ -133,6 +133,11 @@ class CrossLine:
         Direction counts NOT modified here — caller (_poll) accumulates so that
         events from queue-drained frames are never lost.
         Each track is counted only ONCE via track.crossed flag.
+
+        cam — CameraModel (optional). When provided, speed is computed from the
+              track's centroid history at the exact crossing frame via
+              track.lock_crossing_speed(cam). Without it, track.speed_kmh is used
+              as-is (may be 0 if no ROI was set).
         """
         if not self.active or track.crossed or track.hits < 2:
             return None
@@ -146,36 +151,49 @@ class CrossLine:
         x1, y1 = self.p1
         x2, y2 = self.p2
 
-        curr_side = self._side(track.cx,      track.cy,      x1, y1, x2, y2)
-        prev_side = self._side(track.prev_cx,  track.prev_cy, x1, y1, x2, y2)
+        curr_side = self._side(track.cx, track.cy, x1, y1, x2, y2)
 
-        # First appearance inside corridor — initialise side, no crossing yet
+        # First appearance inside corridor — initialise side, no crossing yet.
+        # Skip if centroid is exactly on the line (curr_side == 0) to avoid
+        # storing 0 as a reference side, which would break the crossing test.
         if track.line_side is None:
-            track.line_side = curr_side
+            if curr_side != 0:
+                track.line_side = curr_side
             return None
 
         # Suppress jitter (require real centroid movement)
         motion = np.hypot(track.cx - track.prev_cx, track.cy - track.prev_cy)
         if motion < 2.0:
-            track.line_side = curr_side
+            if curr_side != 0:
+                track.line_side = curr_side
             return None
 
-        # True crossing: centroid moved from one side to the other
-        if prev_side * curr_side < 0:
+        # True crossing: curr_side flipped relative to last stored nonzero side.
+        # We compare against track.line_side (not the raw prev centroid's side)
+        # so that a centroid landing exactly on the line (curr_side == 0) in one
+        # frame does not break detection in the next frame.
+        if curr_side != 0 and track.line_side * curr_side < 0:
             direction       = "IN" if curr_side > 0 else "OUT"
             track.crossed   = True
             track.cross_dir = direction
             track.line_side = curr_side
+
+            # Lock speed at crossing moment using full centroid history.
+            # lock_crossing_speed() runs the alpha-beta estimator regression
+            # and is a no-op on subsequent calls (speed_reported guard).
+            speed = track.lock_crossing_speed(cam)
+
             return {
                 "id":    track.id,
                 "dir":   direction,
                 "frame": fid,
-                "speed": round(track.speed_kmh, 1),
+                "speed": round(speed, 1),
                 "cx":    track.cx,
                 "cy":    track.cy,
             }
 
-        track.line_side = curr_side
+        if curr_side != 0:
+            track.line_side = curr_side
         return None
 
     # ── Drawing ────────────────────────────────────────────────────────────────

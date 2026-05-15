@@ -198,6 +198,10 @@ class TopBar(tk.Frame):
         c = color or STATUS_COLORS.get(text, Theme.TEXT_2)
         self._indicators["status"].config(text=text, fg=c)
 
+    def update_model_name(self, model_name: str):
+        """Update displayed model name in topbar."""
+        self.lbl_model.config(text=model_name or "BG MODE")
+
     def set_model(self, name: str, ok: bool = True):
         self.lbl_model.config(text=name, fg=Theme.CYAN if ok else Theme.DANGER)
 
@@ -431,8 +435,25 @@ class PlaybackBar(tk.Frame):
 
         right = tk.Frame(row, bg=Theme.SURFACE)
         right.pack(side="right", fill="y", pady=6)
-        GlowButton(right, "📷 SCREENSHOT", self.app._take_screenshot,
-                   accent=Theme.PURPLE, width=124, height=36).pack(padx=4)
+
+        GlowButton(right, "📷 SHOT", self.app._take_screenshot,
+                   accent=Theme.PURPLE, width=74, height=36).pack(side="right", padx=(2, 0))
+
+        tk.Frame(right, bg=Theme.BORDER, width=1).pack(side="right", fill="y", padx=6)
+
+        GlowButton(right, "✕ CLR", self.app._clear_line,
+                   accent=Theme.DANGER, width=64, height=36).pack(side="right", padx=2)
+        self.btn_line = GlowButton(right, "— LINE", self.app._line_start,
+                                   accent=Theme.WARNING, width=74, height=36)
+        self.btn_line.pack(side="right", padx=2)
+
+        tk.Frame(right, bg=Theme.BORDER, width=1).pack(side="right", fill="y", padx=6)
+
+        GlowButton(right, "✕ ROI", self.app._clear_all,
+                   accent=Theme.DANGER, width=64, height=36).pack(side="right", padx=2)
+        self.btn_roi = GlowButton(right, "⬢ ROI", self.app._roi_start,
+                                  accent=Theme.CYAN, width=74, height=36)
+        self.btn_roi.pack(side="right", padx=(0, 2))
 
     def set_playing(self, playing: bool):
         self.btn_play.update_text(
