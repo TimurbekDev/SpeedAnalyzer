@@ -1,47 +1,42 @@
 """
-Per-lane following-distance calculator.
+Per-lane following-distance calculator — optimised.
 
-For each tracked vehicle, finds the nearest vehicle behind it in the same
-lane and returns the real-world gap in metres.
+Complexity improvement: O(n²) → O(n log n)
 
-Lane assignment:
-    Lateral position in metric space is quantised into lane bins of
-    `lane_width_m` metres.  Bird's-eye transform (when calibrated) gives
-    a true top-view x-axis, making lane bins accurate.  Without it the
-    raw horizontal pixel / px_per_m approximation is used.
+Original approach: for each vehicle, scan all same-lane vehicles to find rear.
+Optimised approach:
+  1. Batch-transform all centroids to metric space in one call.
+  2. Group track indices by lane ID.
+  3. Sort each lane by metric Y (ascending = further ahead).
+  4. For each vehicle, check only its two immediate sorted neighbours (O(1)).
+     The immediate rear is always adjacent in the sorted order — no full scan.
 
 "Behind" determination:
-    Each vehicle's alpha-beta filtered velocity direction (dvx, dvy) defines
-    its forward hemisphere.  A candidate C is considered "behind" vehicle A
-    when dot((C - A), vel_dir_A) < 0.  Stationary or freshly spawned tracks
-    (|vel| < threshold) fall back to screen-y ordering (larger y = rear).
+  Uses alpha-beta filtered velocity direction (vel_dir).
+  Stationary/new tracks (|vel| < threshold) fall back to screen-Y ordering.
 """
 
 import cv2
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
 class FollowingResult:
     vehicle_id:      int
     lane_id:         int
-    rear_vehicle_id: Optional[int]    # None when no rear vehicle in lane
-    distance_m:      Optional[float]  # None when no rear vehicle in lane
+    rear_vehicle_id: Optional[int]
+    distance_m:      Optional[float]
 
 
 class FollowingDistanceCalculator:
     """
-    Computes per-vehicle following distance to the nearest rear vehicle
-    in the same lane.
+    Per-frame following distance to the nearest rear vehicle in the same lane.
 
-    API mirrors DistanceCalculator so the same BirdseyeTransform calibration
-    can be applied with set_birdseye().
+    API matches DistanceCalculator so the same BirdseyeTransform calibration
+    applies via set_birdseye().
     """
-
-    # Minimum velocity magnitude (px/frame) to trust the direction vector.
-    _VEL_THR: float = 0.3
 
     def __init__(self, lane_width_m: float = 3.5, px_per_m: float = 20.0):
         self.lane_width_m  = max(0.5, float(lane_width_m))
@@ -52,22 +47,18 @@ class FollowingDistanceCalculator:
     # ── Configuration ─────────────────────────────────────────────────────────
 
     def set_birdseye(self, M: Optional[np.ndarray], be_px_per_m: float) -> None:
-        """Mirror of DistanceCalculator.set_birdseye — call after calibration."""
         self._M           = M
         self._be_px_per_m = max(0.1, be_px_per_m) if M is not None else None
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _to_metric(self, raw: np.ndarray) -> np.ndarray:
-        """Project N×2 pixel centroids to metric coordinates (metres)."""
+    def _batch_to_metric(self, raw: np.ndarray) -> np.ndarray:
+        """Vectorized: N×2 pixel centroids → N×2 metric [x_m, y_m]."""
         if self._M is not None and self._be_px_per_m is not None:
             warped = cv2.perspectiveTransform(
                 raw.reshape(-1, 1, 2), self._M).reshape(-1, 2)
             return warped / self._be_px_per_m
         return raw / self.px_per_m
-
-    def _lane_id(self, metric_x: float) -> int:
-        return int(metric_x / self.lane_width_m)
 
     # ── Core computation ──────────────────────────────────────────────────────
 
@@ -75,59 +66,87 @@ class FollowingDistanceCalculator:
         """
         Return one FollowingResult per track.
 
-        O(n²) over tracks in the same lane — fast enough for typical scene
-        sizes (< 30 vehicles).  No memory allocation per pair beyond the
-        result list.
+        Steps:
+          1. Batch centroid → metric (one transform call).
+          2. Group by lane_id.
+          3. Per lane: sort by metric Y → check only adjacent pair for rear.
         """
         if not tracks:
             return []
 
+        n = len(tracks)
+
+        # ── 1. Batch transform ─────────────────────────────────────────────────
         raw    = np.array([[t.cx, t.cy] for t in tracks], dtype=np.float32)
-        metric = self._to_metric(raw)
-        n      = len(tracks)
+        metric = self._batch_to_metric(raw)            # N×2
 
-        lane_ids = [self._lane_id(float(metric[i, 0])) for i in range(n)]
+        # ── 2. Lane assignment ─────────────────────────────────────────────────
+        lane_ids = np.maximum(0, (metric[:, 0] / self.lane_width_m).astype(int))
 
-        results: List[FollowingResult] = []
+        # ── 3. Group track indices by lane ─────────────────────────────────────
+        lanes: Dict[int, List[int]] = {}
+        for i in range(n):
+            lid = int(lane_ids[i])
+            if lid not in lanes:
+                lanes[lid] = []
+            lanes[lid].append(i)
 
-        for i, t in enumerate(tracks):
-            dvx, dvy = t.vel_dir
-            has_dir  = (dvx != 0.0 or dvy != 0.0)
+        # ── 4. Per lane: sort by metric Y, check adjacent neighbours ──────────
+        results: List[Optional[FollowingResult]] = [None] * n
 
-            best_id:   Optional[int] = None
-            best_dist: float         = float('inf')
+        for lid, indices in lanes.items():
+            # Single vehicle in lane → no rear possible.
+            if len(indices) == 1:
+                i = indices[0]
+                results[i] = FollowingResult(
+                    vehicle_id=tracks[i].id, lane_id=lid,
+                    rear_vehicle_id=None, distance_m=None)
+                continue
 
-            for j in range(n):
-                if i == j or lane_ids[j] != lane_ids[i]:
-                    continue
+            # Sort ascending by metric Y (lower Y = further ahead in scene).
+            indices.sort(key=lambda i: float(metric[i, 1]))
 
-                other = tracks[j]
+            for pos, i in enumerate(indices):
+                t        = tracks[i]
+                dvx, dvy = t.vel_dir
+                has_dir  = dvx != 0.0 or dvy != 0.0
 
-                # Determine if `other` is in the rear hemisphere of `t`.
-                if has_dir:
-                    # Negative dot → other is behind t's forward direction.
-                    dot = (other.cx - t.cx) * dvx + (other.cy - t.cy) * dvy
-                    is_rear = dot < 0.0
-                else:
-                    # Fallback for stationary/new tracks: larger screen-y = rear.
-                    is_rear = other.cy > t.cy
+                best_id:   Optional[int] = None
+                best_dist: float         = float("inf")
 
-                if not is_rear:
-                    continue
+                # Only the two immediate neighbours need checking —
+                # the immediate rear is always adjacent in the sorted list.
+                for nb_pos in (pos - 1, pos + 1):
+                    if nb_pos < 0 or nb_pos >= len(indices):
+                        continue
+                    j     = indices[nb_pos]
+                    other = tracks[j]
 
-                dx_m = float(metric[j, 0] - metric[i, 0])
-                dy_m = float(metric[j, 1] - metric[i, 1])
-                dist = (dx_m * dx_m + dy_m * dy_m) ** 0.5
+                    # Rear-hemisphere test.
+                    if has_dir:
+                        dot     = ((other.cx - t.cx) * dvx
+                                   + (other.cy - t.cy) * dvy)
+                        is_rear = dot < 0.0
+                    else:
+                        # Stationary fallback: higher screen Y = rear.
+                        is_rear = other.cy > t.cy
 
-                if dist < best_dist:
-                    best_dist = dist
-                    best_id   = other.id
+                    if not is_rear:
+                        continue
 
-            results.append(FollowingResult(
-                vehicle_id=t.id,
-                lane_id=lane_ids[i],
-                rear_vehicle_id=best_id,
-                distance_m=best_dist if best_id is not None else None,
-            ))
+                    dx_m = float(metric[j, 0] - metric[i, 0])
+                    dy_m = float(metric[j, 1] - metric[i, 1])
+                    dist = (dx_m * dx_m + dy_m * dy_m) ** 0.5
+
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_id   = other.id
+
+                results[i] = FollowingResult(
+                    vehicle_id=t.id,
+                    lane_id=lid,
+                    rear_vehicle_id=best_id,
+                    distance_m=best_dist if best_id is not None else None,
+                )
 
         return results
