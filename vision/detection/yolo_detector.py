@@ -13,7 +13,7 @@ class YOLODetector:
         except Exception:
             self.device = "cpu"
 
-    def detect(self, frame: np.ndarray, roi_mask=None) -> list:
+    def detect(self, frame: np.ndarray) -> list:
         if self.model is None:
             return []
         res = self.model(
@@ -25,14 +25,5 @@ class YOLODetector:
         for b in res.boxes:
             x1, y1, x2, y2 = map(int, b.xyxy[0])
             w, h = x2 - x1, y2 - y1
-            if roi_mask is not None:
-                vm   = np.zeros(roi_mask.shape, np.uint8)
-                vy1_ = max(0, y1); vy2_ = min(roi_mask.shape[0], y2)
-                vx1_ = max(0, x1); vx2_ = min(roi_mask.shape[1], x2)
-                vm[vy1_:vy2_, vx1_:vx2_] = 255
-                overlap = (np.count_nonzero(np.bitwise_and(vm, roi_mask))
-                           / max(w * h, 1))
-                if overlap < 0.3:
-                    continue
             boxes.append((x1, y1, w, h))
         return boxes

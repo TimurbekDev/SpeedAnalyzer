@@ -15,15 +15,13 @@ class BGDetector:
         self.k_close  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
         self.k_dilate = cv2.getStructuringElement(cv2.MORPH_RECT,    (11, 11))
 
-    def detect(self, frame: np.ndarray, roi_mask=None) -> list:
+    def detect(self, frame: np.ndarray) -> list:
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (7, 7), 0)
         fg   = self.bg.apply(gray, learningRate=0.003)
         fg   = np.where(fg == 255, 255, 0).astype(np.uint8)
         fg   = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  self.k_open)
         fg   = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self.k_close)
         fg   = cv2.dilate(fg, self.k_dilate, iterations=2)
-        if roi_mask is not None:
-            fg = cv2.bitwise_and(fg, roi_mask)
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         boxes = []
         for c in cnts:

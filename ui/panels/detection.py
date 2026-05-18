@@ -1,4 +1,4 @@
-"""Detection settings panel — ROI, counting line, camera model, AI model."""
+"""Detection settings panel — counting line, camera model, AI model."""
 
 import tkinter as tk
 from tkinter import ttk
@@ -23,8 +23,7 @@ class DetectionPanel(tk.Frame):
         right = tk.Frame(body, bg=Theme.BG)
         right.pack(side="right", fill="both", expand=True, padx=(6, 0))
 
-        self._card(left, "REGION OF INTEREST", [
-            ("Set ROI",   Theme.CYAN,   self.app._roi_start),
+        self._card(left, "CONTROLS", [
             ("Clear All", Theme.DANGER, self.app._clear_all),
         ])
 

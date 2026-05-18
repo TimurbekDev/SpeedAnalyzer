@@ -185,6 +185,13 @@ class Track:
         return self.speed_kmh
 
     @property
+    def vel_dir(self) -> tuple:
+        """Normalized forward direction (dvx, dvy) in pixel space. (0,0) if stationary."""
+        vx, vy = self._est._vx, self._est._vy
+        mag = (vx * vx + vy * vy) ** 0.5
+        return (vx / mag, vy / mag) if mag > 1e-6 else (0.0, 0.0)
+
+    @property
     def trail(self) -> list:
         return [(int(h[1]), int(h[2])) for h in self.history]
 

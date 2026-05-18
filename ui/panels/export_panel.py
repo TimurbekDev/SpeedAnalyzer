@@ -24,8 +24,8 @@ class ExportPanel(tk.Frame):
         divider(xls_card, bg=Theme.SURFACE)
         toggle_row(xls_card, "Auto-save when stopping", self.app.var_autosave)
         tk.Frame(xls_card, bg=Theme.SURFACE, height=6).pack()
-        GlowButton(xls_card, "⊞  Export to Excel",
-                   self.app._export_excel, accent=Theme.SUCCESS,
+        GlowButton(xls_card, "⊞  Export Unified Report",
+                   self.app._export_unified, accent=Theme.SUCCESS,
                    height=40).pack(fill="x", padx=14, pady=4)
 
         tbl_card = tk.Frame(body, bg=Theme.SURFACE, padx=14, pady=12)

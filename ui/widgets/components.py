@@ -30,6 +30,7 @@ class GlowButton(tk.Canvas):
         self.icon    = icon
         self._hover  = False
         self._press  = False
+        self._active = False   # persistent ON state: accent border+text even without hover
         self.bind("<Enter>",           self._enter)
         self.bind("<Leave>",           self._leave)
         self.bind("<ButtonPress-1>",   self._press_cb)
@@ -42,15 +43,16 @@ class GlowButton(tk.Canvas):
         w = max(self.winfo_width(),  int(self.cget("width")))
         h = max(self.winfo_height(), int(self.cget("height")))
         r = Theme.RADIUS
-        bg = Theme.SURFACE3 if self._hover else Theme.SURFACE2
+        lit = self._hover or self._active
+        bg  = Theme.SURFACE3 if self._hover else Theme.SURFACE2
         if self._press:
             bg = Theme.SURFACE
         self._rrect(0, 0, w, h, r, fill=bg,
-                    outline=self.accent if self._hover else Theme.BORDER, width=1)
-        if self._hover:
+                    outline=self.accent if lit else Theme.BORDER, width=1)
+        if lit:
             self.create_rectangle(r, h - 2, w - r, h, fill=self.accent, outline="")
         label = f"{self.icon} {self.text}" if self.icon else self.text
-        color = self.accent if self._hover else Theme.TEXT_2
+        color = self.accent if lit else Theme.TEXT_3
         self.create_text(w // 2, h // 2, text=label, fill=color,
                          font=Theme.F_MONO_S, anchor="center")
 
@@ -67,6 +69,11 @@ class GlowButton(tk.Canvas):
         self._press = False; self._draw()
         if self.command:
             self.command()
+
+    def set_active(self, active: bool) -> None:
+        """Persistent lit state: accent border + text shown even without hover."""
+        self._active = active
+        self._draw()
 
     def update_text(self, text, accent=None):
         self.text = text
@@ -458,11 +465,15 @@ class PlaybackBar(tk.Frame):
 
         tk.Frame(right, bg=Theme.BORDER, width=1).pack(side="right", fill="y", padx=6)
 
-        GlowButton(right, "✕ ROI", self.app._clear_all,
-                   accent=Theme.DANGER, width=64, height=36).pack(side="right", padx=2)
-        self.btn_roi = GlowButton(right, "⬢ ROI", self.app._roi_start,
-                                  accent=Theme.CYAN, width=74, height=36)
-        self.btn_roi.pack(side="right", padx=(0, 2))
+        # Analytics toggle buttons — active (lit) by default.
+        self.btn_dist = GlowButton(right, "DST", self.app._toggle_dist,
+                                   accent=Theme.CYAN, width=60, height=36)
+        self.btn_dist.set_active(True)
+        self.btn_dist.pack(side="right", padx=2)
+        self.btn_speed = GlowButton(right, "SPD", self.app._toggle_speed,
+                                    accent=Theme.SUCCESS, width=60, height=36)
+        self.btn_speed.set_active(True)
+        self.btn_speed.pack(side="right", padx=(0, 2))
 
     def set_playing(self, playing: bool):
         self.btn_play.update_text(

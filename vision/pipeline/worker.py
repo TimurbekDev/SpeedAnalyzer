@@ -1,8 +1,9 @@
 """
 Worker thread — consumes (fid, frame) from in_q, runs detect+track,
-pushes (frame, tracks, finished, crossings) to out_q.
+pushes (frame, tracks, finished, crossings, following) to out_q.
 
-Thread-safe cross_line, roi_mask, and proximity zone updates via Lock.
+Thread-safe cross_line and proximity zone updates via Lock.
+Speed/distance processing gated by threading.Events set from the UI thread.
 """
 import queue
 import threading
@@ -14,7 +15,10 @@ class Worker(threading.Thread):
     def __init__(self, yolo_det, bg_det, enhancer, tracker, in_q, out_q,
                  cross_line=None,
                  prox_zone=None, prox_calc=None,
-                 prox_analytics=None, prox_area_m2=5000.0):
+                 prox_analytics=None, prox_area_m2=5000.0,
+                 following_calc=None, crossing_calc=None,
+                 speed_event:   threading.Event | None = None,
+                 dist_event:    threading.Event | None = None):
         super().__init__(daemon=True)
         self.yolo  = yolo_det
         self.bg    = bg_det
@@ -25,19 +29,21 @@ class Worker(threading.Thread):
         self._stop = threading.Event()
         self._fid  = 0
         self._last_boxes: list              = []
-        self._roi_mask:   np.ndarray | None = None
         self._cross_line                    = cross_line
         self._prox_zone:  np.ndarray | None = prox_zone
         self._prox_calc                     = prox_calc
         self._prox_analytics                = prox_analytics
         self._prox_area_m2: float           = prox_area_m2
+        self._following_calc                = following_calc
+        self._crossing_calc                 = crossing_calc
         self._lock = threading.Lock()
 
-    # ── Thread-safe setters ───────────────────────────────────────────────────
+        # Feature gates — checked each frame without acquiring the main lock.
+        # Use threading.Event so the UI thread can toggle them safely at any time.
+        self._speed_en = speed_event or _AlwaysSet()
+        self._dist_en  = dist_event  or _AlwaysSet()
 
-    def set_roi(self, mask: np.ndarray) -> None:
-        with self._lock:
-            self._roi_mask = mask
+    # ── Thread-safe setters ───────────────────────────────────────────────────
 
     def set_cross_line(self, cl) -> None:
         with self._lock:
@@ -75,7 +81,6 @@ class Worker(threading.Thread):
             enhanced   = self.enh.process(frame)
 
             with self._lock:
-                roi  = self._roi_mask
                 cl   = self._cross_line
                 pz   = self._prox_zone
                 pc   = self._prox_calc
@@ -84,9 +89,9 @@ class Worker(threading.Thread):
 
             if self._fid % max(1, FRAME_SKIP) == 0:
                 if self.yolo and self.yolo.model:
-                    self._last_boxes = self.yolo.detect(enhanced, None)
+                    self._last_boxes = self.yolo.detect(enhanced)
                 else:
-                    self._last_boxes = self.bg.detect(enhanced, roi)
+                    self._last_boxes = self.bg.detect(enhanced)
             self._fid += 1
 
             tracks   = self.trk.update(self._last_boxes, fid)
@@ -94,26 +99,39 @@ class Worker(threading.Thread):
             self.trk.finished.clear()
 
             cam = self.trk.cam
-            for t in tracks:
-                if self._in_roi(t.cx, t.cy, roi):
+
+            # ── Speed calculation (gated) ──────────────────────────────────
+            if self._speed_en.is_set():
+                for t in tracks:
                     t.calc_speed(cam)
 
-            # ── Crossing detection ─────────────────────────────────────────
+            # ── Crossing detection (always active) ─────────────────────────
             crossings: list[dict] = []
             if cl and cl.active:
                 for t in self.trk.tracks:
                     ev = cl.check_track(t, fid, cam=cam)
                     if ev:
+                        # Attach following distance only when dist module is on.
+                        if (self._dist_en.is_set()
+                                and self._crossing_calc is not None):
+                            ev["crossing_dist"] = self._crossing_calc.find_rear(
+                                ev, self.trk.tracks, cl)
                         crossings.append(ev)
 
-            # ── Proximity analytics ────────────────────────────────────────
-            if pz is not None and pc is not None and pa is not None:
+            # ── Proximity analytics (gated) ────────────────────────────────
+            if self._dist_en.is_set() and pz is not None \
+                    and pc is not None and pa is not None:
                 zone_tracks = [t for t in self.trk.tracks
                                if self._in_roi(t.cx, t.cy, pz)]
                 pairs = pc.compute(zone_tracks)
                 pa.update(pairs, len(zone_tracks), pa2)
 
-            result = (enhanced, tracks, finished, crossings)
+            # ── Following distance (gated) ─────────────────────────────────
+            following = (self._following_calc.compute(tracks)
+                         if self._dist_en.is_set()
+                         and self._following_calc is not None else [])
+
+            result = (enhanced, tracks, finished, crossings, following)
             try:
                 self.out_q.put_nowait(result)
             except queue.Full:
@@ -124,3 +142,9 @@ class Worker(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
+
+
+class _AlwaysSet:
+    """Drop-in for threading.Event that is always set (feature always enabled)."""
+    def is_set(self) -> bool:
+        return True

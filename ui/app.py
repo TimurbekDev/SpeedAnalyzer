@@ -27,8 +27,10 @@ from vision.rendering.frame_renderer import draw_tracks, draw_cross_flash
 from vision.pipeline.worker         import Worker
 from vision.proximity import (DistanceCalculator, ProximityAnalytics,
                                render_proximity_overlay, HeatmapAccumulator,
-                               BirdseyeTransform)
-
+                               BirdseyeTransform,
+                               FollowingDistanceCalculator, FollowingResult,
+                               CrossingDistanceCalculator)
+from vision.export import TrafficReportExporter, make_filename
 from ui.theme.dark          import Theme
 from ui.widgets.components  import TopBar, SidebarNav, PlaybackBar, ToastManager
 from ui.dialogs.calibrator  import CalibratorWindow
@@ -39,14 +41,6 @@ from ui.panels.analytics    import AnalyticsPanel
 from ui.panels.proximity_panel import ProximityPanel
 from ui.panels.settings_panel import SettingsPanel
 from ui.panels.export_panel import ExportPanel
-
-try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-    EXCEL_OK = True
-except ImportError:
-    EXCEL_OK = False
 
 
 class SpeedAnalyzerModern:
@@ -73,11 +67,6 @@ class SpeedAnalyzerModern:
         self._last_frame:  np.ndarray | None = None
         self._last_tracks: list = []
         self._ftimes = deque(maxlen=30)
-
-        self.roi:          list               = []
-        self._drawing_roi: bool               = False
-        self._roi_tmp:     list | None        = None
-        self._roi_mask:    np.ndarray | None  = None
 
         self.sx = self.sy = 1.0
         self.ox = self.oy = 0
@@ -107,6 +96,13 @@ class SpeedAnalyzerModern:
         self._prox_refresh_t:   float = 0.0
         self._prox_log:         list  = []
         self._prox_log_counter: int   = 0
+
+        self._last_following:   list  = []  # List[FollowingResult], updated each frame
+
+        self._speed_event = threading.Event()
+        self._dist_event  = threading.Event()
+        self._speed_event.set()
+        self._dist_event.set()
 
         self._stab_dx = self._stab_dy = 0.0
         self._violations = 0
@@ -150,8 +146,13 @@ class SpeedAnalyzerModern:
         self.prox_calc      = DistanceCalculator(px_per_m=PROX_PX_PER_M)
         self.prox_analytics = ProximityAnalytics(
             safe_m=PROX_SAFE_DIST_M, warn_m=PROX_WARN_DIST_M)
-        self.birdseye  = BirdseyeTransform()
-        self.heatmap   = HeatmapAccumulator()
+        self.birdseye          = BirdseyeTransform()
+        self.heatmap           = HeatmapAccumulator()
+        self.following_calc    = FollowingDistanceCalculator(
+            px_per_m=PROX_PX_PER_M)
+        self.crossing_calc = CrossingDistanceCalculator(
+            px_per_m=PROX_PX_PER_M)
+        self._exporter     = TrafficReportExporter()
 
     def reload_yolo(self, model_name: str):
         """Load a different YOLO model (e.g. 'yolov8s', 'yolov8m')."""
@@ -257,10 +258,11 @@ class SpeedAnalyzerModern:
         self.playbar.set_time(0, total / self.fps)
         self.tracker   = Tracker(self.fps, self.cam)
         self.results   = []; self.recorded_ids = set(); self._cross_flash = {}
-        self.roi       = []; self._roi_mask = None
         self._total    = 0;  self._violations = 0
-        self._prox_zone = []; self._prox_zone_mask = None
-        self._prox_log  = []; self._prox_log_counter = 0
+        self._prox_zone      = []; self._prox_zone_mask = None
+        self._prox_log       = []; self._prox_log_counter = 0
+        self._last_following = []
+        self._exporter.reset()
         self.prox_analytics.reset(); self.heatmap.reset()
         self._panels["dashboard"].chart.reset()
         ok, f = self.cap.read()
@@ -269,6 +271,12 @@ class SpeedAnalyzerModern:
             self._last_tracks = []
             self._panels["dashboard"].video.set_has_frame()
             self._render()
+            # Auto-define default crossline at 60% frame height if none active
+            if not self.cross_line.active:
+                fh, fw = f.shape[:2]
+                y0 = int(fh * 0.60)
+                self.cross_line.define([0, y0], [fw, y0])
+                self.cross_line.set_width(self.var_lane_hw.get())
         self.root.title(f"Speed Analyzer Pro — {self.video_name}")
         self.topbar.set_status("IDLE")
         self.topbar.set_model(self.model_name or "BG MODE")
@@ -302,9 +310,11 @@ class SpeedAnalyzerModern:
                              prox_zone=self._prox_zone_mask,
                              prox_calc=self.prox_calc,
                              prox_analytics=self.prox_analytics,
-                             prox_area_m2=self._prox_zone_area_m2)
-        if self._roi_mask is not None:
-            self.worker.set_roi(self._roi_mask)
+                             prox_area_m2=self._prox_zone_area_m2,
+                             following_calc=self.following_calc,
+                             crossing_calc=self.crossing_calc,
+                             speed_event=self._speed_event,
+                             dist_event=self._dist_event)
         self.worker.start()
         self.cap_thread = threading.Thread(target=self._cap_loop, daemon=True)
         self.cap_thread.start()
@@ -324,7 +334,7 @@ class SpeedAnalyzerModern:
             self.worker.stop()
             self.worker = None
         if self.var_autosave.get() and self.results:
-            self._do_save_excel(auto=True)
+            self._export_unified(auto=True)
 
     def _cap_loop(self):
         interval = 1.0 / self.fps
@@ -366,11 +376,12 @@ class SpeedAnalyzerModern:
                     self._stop_play()
                     self.toast.show("Video finished.", "info")
                     return
-                frame_d, tracks_d, finished_d, crossings_d = item
+                frame_d, tracks_d, finished_d, crossings_d, following_d = item
                 latest_frame  = frame_d
                 latest_tracks = tracks_d
                 all_finished.extend(finished_d)
                 all_crossings.extend(crossings_d)
+                self._last_following = following_d
         except queue.Empty:
             pass
 
@@ -470,6 +481,9 @@ class SpeedAnalyzerModern:
         self.results.append(record)
         self._panels["dashboard"].log_detection(track_id, speed, ev["dir"], limit)
 
+        dist_result = ev.get("crossing_dist")
+        self._exporter.append(record, dist_result, limit)
+
     # ── Step / seek ───────────────────────────────────────────────────────────
     def _step(self, n: int):
         if not self.cap:
@@ -504,16 +518,9 @@ class SpeedAnalyzerModern:
             total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.playbar.set_time(pos / self.fps, total / self.fps)
 
-    # ── Canvas / ROI / line ───────────────────────────────────────────────────
-    def _roi_start(self):
-        self._drawing_roi  = True
-        self._drawing_line = False
-        self.roi = []; self._roi_tmp = None
-        self.toast.show("Left-click to add ROI points. Right-click to finish.", "info")
-
+    # ── Canvas / line ────────────────────────────────────────────────────────
     def _line_start(self):
         self._drawing_line = True
-        self._drawing_roi  = False
         self._line_p1      = None
         self._line_tmp     = None
         self.cross_line.clear()
@@ -550,10 +557,6 @@ class SpeedAnalyzerModern:
                 hw = self.var_lane_hw.get()
                 self.toast.show(f"Counting line set  |  corridor ±{hw}px", "success")
             return
-        if self._drawing_roi:
-            self.roi.append([vx, vy])
-            self._render()
-            return
         if self._drawing_prox:
             self._prox_zone.append([vx, vy])
             self._render()
@@ -563,18 +566,6 @@ class SpeedAnalyzerModern:
             self._drawing_line = False
             self._line_p1 = self._line_tmp = None
             self._render()
-            return
-        if self._drawing_roi and len(self.roi) >= 3:
-            self._drawing_roi = False
-            self._roi_tmp     = None
-            fh, fw = self._last_frame.shape[:2]
-            mask = np.zeros((fh, fw), np.uint8)
-            cv2.fillPoly(mask, [np.array(self.roi, np.int32)], 255)
-            self._roi_mask = mask
-            if self.worker:
-                self.worker.set_roi(mask)
-            self._render()
-            self.toast.show("ROI applied.", "success")
             return
         if self._drawing_prox and len(self._prox_zone) >= 3:
             self._drawing_prox = False
@@ -602,9 +593,6 @@ class SpeedAnalyzerModern:
         if self._drawing_line:
             self._line_tmp = [vx, vy]
             self._render()
-        elif self._drawing_roi:
-            self._roi_tmp = [vx, vy]
-            self._render()
         elif self._drawing_prox:
             self._prox_tmp = [vx, vy]
             self._render()
@@ -617,7 +605,6 @@ class SpeedAnalyzerModern:
 
     def _prox_start(self):
         self._drawing_prox = True
-        self._drawing_roi  = False
         self._drawing_line = False
         self._prox_zone    = []
         self._prox_tmp     = None
@@ -644,14 +631,23 @@ class SpeedAnalyzerModern:
 
     def _apply_prox_settings(self):
         px_m = max(0.1, self.var_prox_px_m.get())
-        self.prox_calc.px_per_m       = px_m
+        self.prox_calc.px_per_m      = px_m
+        self.following_calc.px_per_m = px_m
+        self.crossing_calc.px_per_m  = px_m
         self.prox_analytics.safe_m    = self.var_safe_dist.get()
         self.prox_analytics.warn_m    = self.var_warn_dist.get()
         if self.var_use_birdseye.get() and self.birdseye.active:
             self.prox_calc.set_birdseye(self.birdseye.M,
                                         self.birdseye.px_per_m_out)
+            self.following_calc.set_birdseye(self.birdseye.M,
+                                             self.birdseye.px_per_m_out)
+            self.crossing_calc.set_birdseye(self.birdseye.M,
+                                            self.birdseye.px_per_m_x,
+                                            self.birdseye.px_per_m_y)
         else:
             self.prox_calc.set_birdseye(None, 0.0)
+            self.following_calc.set_birdseye(None, 0.0)
+            self.crossing_calc.set_birdseye(None, 1.0, 1.0)
         # Recompute zone area with new px_m if zone exists
         if len(self._prox_zone) >= 3:
             area_px = float(cv2.contourArea(
@@ -661,6 +657,24 @@ class SpeedAnalyzerModern:
                 self.worker.set_prox_zone(self._prox_zone_mask,
                                           self._prox_zone_area_m2)
         self.toast.show("Proximity settings applied.", "success")
+
+    # ── Feature toggles ──────────────────────────────────────────────────────
+
+    def _toggle_speed(self):
+        if self._speed_event.is_set():
+            self._speed_event.clear()
+            self.playbar.btn_speed.set_active(False)
+        else:
+            self._speed_event.set()
+            self.playbar.btn_speed.set_active(True)
+
+    def _toggle_dist(self):
+        if self._dist_event.is_set():
+            self._dist_event.clear()
+            self.playbar.btn_dist.set_active(False)
+        else:
+            self._dist_event.set()
+            self.playbar.btn_dist.set_active(True)
 
     # ── Bird's-eye calibration ────────────────────────────────────────────────
 
@@ -727,8 +741,7 @@ class SpeedAnalyzerModern:
 
     def _clear_all(self):
         self._stop_play()
-        self.roi           = []; self._roi_mask = None
-        self._drawing_roi  = False; self._drawing_line = False
+        self._drawing_line = False
         self._line_tmp     = None; self._line_p1 = None
         self.cross_line.clear()
         self._panels["dashboard"].update_crossing(0, 0)
@@ -741,7 +754,9 @@ class SpeedAnalyzerModern:
         # Proximity reset
         self._prox_zone    = []; self._prox_zone_mask = None
         self._drawing_prox = False; self._prox_tmp = None
-        self._prox_log     = []; self._prox_log_counter = 0
+        self._prox_log        = []; self._prox_log_counter = 0
+        self._last_following = []
+        self._exporter.reset()
         self.prox_analytics.reset()
         self.heatmap.reset()
         self._last_prox_snap = {
@@ -766,20 +781,6 @@ class SpeedAnalyzerModern:
         self.sy = fh / max(nh, 1)
         self.ox = (cw - nw) // 2
         self.oy = (ch - nh) // 2
-
-        if len(self.roi) >= 3:
-            ov = d.copy()
-            cv2.fillPoly(ov, [np.array(self.roi, np.int32)], (20, 80, 20))
-            cv2.addWeighted(ov, 0.15, d, 0.85, 0, d)
-            cv2.polylines(d, [np.array(self.roi, np.int32)], True, (50, 220, 50), 2)
-        elif self.roi:
-            for i, pt in enumerate(self.roi):
-                cv2.circle(d, tuple(pt), 5, (50, 220, 50), -1)
-                if i > 0:
-                    cv2.line(d, tuple(self.roi[i-1]), tuple(pt), (50, 220, 50), 2)
-            if self._roi_tmp and self._drawing_roi:
-                cv2.line(d, tuple(self.roi[-1]), tuple(self._roi_tmp),
-                         (50, 220, 50), 1)
 
         # Proximity zone (purple)
         if len(self._prox_zone) >= 3:
@@ -824,6 +825,32 @@ class SpeedAnalyzerModern:
                 warn_m=self.var_warn_dist.get(),
                 show_labels=self.var_show_labels.get(),
             )
+
+        # Following-distance overlay: dashed arrow + gap label per track
+        if self._last_following:
+            track_pos = {t.id: (int(t.cx), int(t.cy)) for t in self._last_tracks}
+            for fr in self._last_following:
+                if fr.rear_vehicle_id is None or fr.distance_m is None:
+                    continue
+                pa = track_pos.get(fr.vehicle_id)
+                pb = track_pos.get(fr.rear_vehicle_id)
+                if pa is None or pb is None:
+                    continue
+                safe_m = self.var_safe_dist.get()
+                warn_m = self.var_warn_dist.get()
+                if fr.distance_m >= safe_m:
+                    color = (0, 220, 80)
+                elif fr.distance_m >= warn_m:
+                    color = (0, 200, 240)
+                else:
+                    color = (0, 60, 255)
+                cv2.arrowedLine(d, pb, pa, color, 1, cv2.LINE_AA, tipLength=0.2)
+                mx, my = (pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2
+                txt = f"{fr.distance_m:.1f}m"
+                cv2.putText(d, txt, (mx + 2, my - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(d, txt, (mx + 2, my - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, color, 1, cv2.LINE_AA)
 
         if self.var_speed_lbl.get() and self._cross_flash:
             now = time.perf_counter()
@@ -947,61 +974,25 @@ class SpeedAnalyzerModern:
         cv2.imwrite(path, self._last_frame)
         self.toast.show(f"Screenshot saved: {path}", "success")
 
-    # ── Excel export ──────────────────────────────────────────────────────────
-    def _export_excel(self):
-        if not EXCEL_OK:
+    # ── Unified Excel export ───────────────────────────────────────────────────
+    def _export_unified(self, auto: bool = False):
+        if not TrafficReportExporter.available():
             messagebox.showerror("Error", "openpyxl not installed."); return
-        if not self.results:
-            self.toast.show("No results to export.", "warning"); return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx")],
-            initialfile=f"speed_report_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
-        if path:
-            self._do_save_excel(path=path)
-
-    def _do_save_excel(self, path: str = None, auto: bool = False):
-        if not EXCEL_OK or not self.results:
+        if not self._exporter._rows:
+            if not auto:
+                self.toast.show("No crossing events to export.", "warning")
             return
-        if path is None:
-            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = f"speed_report_{ts}.xlsx"
+        if auto:
+            path = make_filename()
+        else:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel", "*.xlsx")],
+                initialfile=make_filename())
+            if not path:
+                return
         try:
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Speed Report"
-
-            hdr_fill = PatternFill("solid", fgColor="0D1526")
-            hdr_font = Font(bold=True, color="00E5FF", name="Consolas", size=10)
-            def_font = Font(name="Consolas", size=9)
-            red_font = Font(name="Consolas", size=9, color="FF3366")
-            center   = Alignment(horizontal="center")
-            thin     = Side(style="thin", color="1E3A5F")
-            border   = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-            headers = ["ID", "Speed (km/h)", "Direction",
-                       "Timestamp", "Video", "Over Limit"]
-            for ci, h in enumerate(headers, 1):
-                c = ws.cell(row=1, column=ci, value=h)
-                c.fill = hdr_fill; c.font = hdr_font
-                c.alignment = center; c.border = border
-
-            limit = self.var_limit.get()
-            for ri, r in enumerate(self.results, 2):
-                spd  = r.get("speed_kmh", 0)
-                over = "YES" if spd > limit else "NO"
-                row_vals = [r.get("id"), spd,
-                            r.get("cross_dir", ""), r.get("timestamp", ""),
-                            r.get("video", ""), over]
-                for ci, val in enumerate(row_vals, 1):
-                    c = ws.cell(row=ri, column=ci, value=val)
-                    c.font = red_font if over == "YES" else def_font
-                    c.alignment = center; c.border = border
-
-            for ci, w in enumerate([8, 14, 12, 22, 30, 12], 1):
-                ws.column_dimensions[get_column_letter(ci)].width = w
-
-            wb.save(path)
+            self._exporter.export(path, self.var_limit.get())
             if not auto:
                 self.toast.show(f"Exported: {os.path.basename(path)}", "success")
         except Exception as ex:

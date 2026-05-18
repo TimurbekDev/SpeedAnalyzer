@@ -20,7 +20,9 @@ class BirdseyeTransform:
 
     def __init__(self):
         self.M:            Optional[np.ndarray] = None
-        self.px_per_m_out: float = 1.0
+        self.px_per_m_out: float = 1.0   # average scale (kept for DistanceCalculator compat)
+        self.px_per_m_x:   float = 1.0   # x-axis (lateral) pixels per metre
+        self.px_per_m_y:   float = 1.0   # y-axis (longitudinal) pixels per metre
         self.active        = False
 
     def calibrate(self,
@@ -34,12 +36,14 @@ class BirdseyeTransform:
             [0,             self.OUT_H - 1],
         ], dtype=np.float32)
         self.M = cv2.getPerspectiveTransform(src_pts.astype(np.float32), dst)
-        px_per_m_x = self.OUT_W / max(width_m,  1e-3)
-        px_per_m_y = self.OUT_H / max(height_m, 1e-3)
-        self.px_per_m_out = (px_per_m_x + px_per_m_y) / 2.0
+        self.px_per_m_x   = self.OUT_W / max(width_m,  1e-3)
+        self.px_per_m_y   = self.OUT_H / max(height_m, 1e-3)
+        self.px_per_m_out = (self.px_per_m_x + self.px_per_m_y) / 2.0
         self.active = True
 
     def clear(self) -> None:
         self.M            = None
         self.px_per_m_out = 1.0
+        self.px_per_m_x   = 1.0
+        self.px_per_m_y   = 1.0
         self.active       = False
