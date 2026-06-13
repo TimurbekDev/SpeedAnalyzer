@@ -1,56 +1,57 @@
-"""Main application class — wires backend to modern UI."""
+"""
+LaneDistanceApp — single-screen, MULTI-lane vehicle-distance tool.
+
+Flow:  Open video → add one or more lane ROIs → set real length/width (VERIFY
+       GRID) → Start → ByteTrack tracks every vehicle in the frame ONCE → each
+       ROI keeps the vehicles inside it → per-vehicle speed + gap to the vehicle
+       ahead → one row per vehicle per lane → each lane auto-saves its own Excel.
+
+Multi-ROI design
+────────────────
+Detection/tracking happens a single time per frame on the whole frame, so all
+lanes share one stable set of ByteTrack ids (no ID churn / duplicate rows).  The
+worker only *filters* those shared detections into each lane.  Lanes share the
+real length/width calibration but each keeps its own homography (its corners
+differ).
+
+Threading mirrors a standard capture/worker/UI split:
+  • capture thread  : reads frames, lossless push → in_q (every frame tracked)
+  • Worker thread   : ByteTrack detect+track + per-lane metrics → out_q
+  • Tk UI thread    : _poll drains out_q, renders, records rows
+ROI editing is only allowed while stopped, so geometry never changes under the
+worker — no locks required.
+"""
+
+import os
+import queue
+import threading
+from collections import deque
 
 import cv2
 import numpy as np
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
-import threading
-import queue
-import time
-import os
-from datetime import datetime
-from collections import deque
 
-from config.defaults import (CONF_DEFAULT, CAP_Q_SIZE, RES_Q_SIZE,
-                             PROX_SAFE_DIST_M, PROX_WARN_DIST_M,
-                             PROX_PX_PER_M, PROX_LOG_INTERVAL)
-from core.entities.track import Track
+from config.defaults import (CAP_Q_SIZE, RES_Q_SIZE, ROI_HANDLE_PX, ROI_MIN_POINTS,
+                             ROI_COLOR, LANE_LENGTH_M_DEFAULT, LANE_WIDTH_M_DEFAULT,
+                             EXPORT_DIR, GRID_STEP_M, SAFE_GAP_M, WARN_GAP_M)
 from vision.detection.loader        import load_yolo
-from vision.detection.bg_detector   import BGDetector
-from vision.detection.enhancer      import Enhancer
-from vision.tracking.stabilizer     import VideoStabilizer
-from vision.tracking.tracker        import Tracker
-from vision.geometry.camera_model   import CameraModel
-from vision.geometry.lane_counter   import CrossLine
-from vision.rendering.frame_renderer import draw_tracks, draw_cross_flash
+from vision.rendering.frame_renderer import draw_tracks
 from vision.pipeline.worker         import Worker
-from vision.proximity import (DistanceCalculator, ProximityAnalytics,
-                               render_proximity_overlay, HeatmapAccumulator,
-                               BirdseyeTransform,
-                               FollowingDistanceCalculator, FollowingResult,
-                               CrossingDistanceCalculator)
-from vision.export import TrafficReportExporter, make_filename
-from ui.theme.dark          import Theme
-from ui.widgets.components  import TopBar, SidebarNav, PlaybackBar, ToastManager
-from ui.dialogs.calibrator  import CalibratorWindow
-from ui.dialogs.birdseye_dialog import BirdseyeDialog
-from ui.panels.dashboard    import DashboardPanel
-from ui.panels.detection    import DetectionPanel
-from ui.panels.analytics    import AnalyticsPanel
-from ui.panels.proximity_panel import ProximityPanel
-from ui.panels.settings_panel import SettingsPanel
-from ui.panels.export_panel import ExportPanel
+from vision.roi                     import RoiManager
+from vision.export                  import DistanceExporter, make_filename
+from ui.theme.dark                  import Theme
+from ui.widgets.components          import (GlowButton, VideoPanel, ToastManager,
+                                            section_label, divider, param_row)
 
 
-class SpeedAnalyzerModern:
+class LaneDistanceApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self._session_start = time.time()
         self._init_state()
         self._load_backend()
         self._build_ui()
-        self._ui_loop()
 
     # ── State ─────────────────────────────────────────────────────────────────
     def _init_state(self):
@@ -65,181 +66,210 @@ class SpeedAnalyzerModern:
         self.out_q: queue.Queue = queue.Queue(maxsize=RES_Q_SIZE)
 
         self._last_frame:  np.ndarray | None = None
-        self._last_tracks: list = []
+        self._last_tracks: list = []             # all vehicles tracked in stream
+        self._inside_ids:  list = []             # union of in-lane ids (render)
+        self._speeds:      dict = {}             # merged {track_id: km/h} (render)
+        self._nexts:       dict = {}             # merged {id: (next_id, gap_m)}
+        self._lanes_live:  dict = {}             # name -> per-lane live result
         self._ftimes = deque(maxlen=30)
 
         self.sx = self.sy = 1.0
         self.ox = self.oy = 0
-
-        self.results:      list = []
-        self.recorded_ids: set  = set()
-        self.ssdir = "speed_screenshots"
-        os.makedirs(self.ssdir, exist_ok=True)
         self._slider_busy = False
 
-        self.cross_line    = CrossLine()
-        self._drawing_line = False
-        self._line_p1:  list | None = None
-        self._line_tmp: list | None = None
-        self._cross_flash: dict = {}
+        # ROIs
+        self.rois         = RoiManager()
+        self.exporters:   dict = {}              # lane name -> DistanceExporter
+        self._roi_mode:   str | None = None      # None | "draw" | "edit"
+        self._roi_draft:  list       = []
+        self._roi_tmp:    list | None = None
+        self._drag_idx:   int | None = None
 
-        # Proximity zone (second drawable zone for distance analytics)
-        self._prox_zone:        list              = []
-        self._drawing_prox:     bool              = False
-        self._prox_tmp:         list | None       = None
-        self._prox_zone_mask:   np.ndarray | None = None
-        self._prox_zone_area_m2: float            = 5000.0
-        self._last_prox_snap:   dict              = {
-            "pairs": [], "count": 0, "min_m": 0.0,
-            "max_m": 0.0, "avg_m": 0.0, "congestion": 0.0, "density": 0.0,
-        }
-        self._prox_refresh_t:   float = 0.0
-        self._prox_log:         list  = []
-        self._prox_log_counter: int   = 0
-
-        self._last_following:   list  = []  # List[FollowingResult], updated each frame
-
-        self._speed_event = threading.Event()
-        self._dist_event  = threading.Event()
-        self._speed_event.set()
-        self._dist_event.set()
-
-        self._stab_dx = self._stab_dy = 0.0
-        self._violations = 0
-        self._total      = 0
-
-        self.var_limit     = tk.DoubleVar(value=60.0)
-        self.var_stab      = tk.BooleanVar(value=True)
-        self.var_stabview  = tk.BooleanVar(value=True)
-        self.var_cam_on    = tk.BooleanVar(value=False)
-        self.var_cam_H     = tk.DoubleVar(value=6.0)
-        self.var_cam_T     = tk.DoubleVar(value=15.0)
-        self.var_cam_P     = tk.DoubleVar(value=0.0)
-        self.var_cam_F     = tk.DoubleVar(value=800.0)
-        self.var_min_a     = tk.IntVar(value=1500)
-        self.var_max_a     = tk.IntVar(value=150000)
-        self.var_trail     = tk.BooleanVar(value=True)
-        self.var_boxes     = tk.BooleanVar(value=True)
-        self.var_speed_lbl = tk.BooleanVar(value=True)
-        self.var_autosave  = tk.BooleanVar(value=True)
-        self.var_speed_mul = tk.DoubleVar(value=1.0)
-        self.var_speed_k   = tk.DoubleVar(value=1.0)
-        self.var_conf      = tk.DoubleVar(value=CONF_DEFAULT)
-        self.var_lane_hw   = tk.IntVar(value=CrossLine.DEFAULT_HW)
-
-        # Proximity analytics controls
-        self.var_safe_dist    = tk.DoubleVar(value=PROX_SAFE_DIST_M)
-        self.var_warn_dist    = tk.DoubleVar(value=PROX_WARN_DIST_M)
-        self.var_prox_px_m    = tk.DoubleVar(value=PROX_PX_PER_M)
-        self.var_show_dist    = tk.BooleanVar(value=True)
-        self.var_show_labels  = tk.BooleanVar(value=True)
-        self.var_show_heatmap = tk.BooleanVar(value=False)
-        self.var_use_birdseye = tk.BooleanVar(value=False)
+        self.var_lane_len = tk.DoubleVar(value=LANE_LENGTH_M_DEFAULT)
+        self.var_lane_wid = tk.DoubleVar(value=LANE_WIDTH_M_DEFAULT)
+        self.var_safe_gap = tk.DoubleVar(value=SAFE_GAP_M)
+        self.var_show_grid = tk.BooleanVar(value=False)
 
     def _load_backend(self):
         self.yolo_det, self.model_name = load_yolo()
-        self.bg_det    = BGDetector()
-        self.enhancer  = Enhancer()
-        self.stabilizer = VideoStabilizer()
-        self.cam       = CameraModel()
-        self.tracker   = Tracker(30.0, self.cam)
-        self.prox_calc      = DistanceCalculator(px_per_m=PROX_PX_PER_M)
-        self.prox_analytics = ProximityAnalytics(
-            safe_m=PROX_SAFE_DIST_M, warn_m=PROX_WARN_DIST_M)
-        self.birdseye          = BirdseyeTransform()
-        self.heatmap           = HeatmapAccumulator()
-        self.following_calc    = FollowingDistanceCalculator(
-            px_per_m=PROX_PX_PER_M)
-        self.crossing_calc = CrossingDistanceCalculator(
-            px_per_m=PROX_PX_PER_M)
-        self._exporter     = TrafficReportExporter()
-
-    def reload_yolo(self, model_name: str):
-        """Load a different YOLO model (e.g. 'yolov8s', 'yolov8m')."""
-        print(f"[APP] Switching to {model_name}...")
-        det, name = load_yolo(model_name=model_name)
-        if det is None:
-            self.toast.show(f"Failed to load {model_name}", "error")
-            return
-        self.yolo_det = det
-        self.model_name = name
-        self.topbar.update_model_name(name)
-        self.toast.show(f"Switched to {name}", "info")
 
     # ── UI build ──────────────────────────────────────────────────────────────
     def _build_ui(self):
-        self.root.title("Speed Analyzer Pro")
-        self.root.geometry("1480x900")
-        self.root.minsize(1200, 700)
+        self.root.title("Lane Distance — Vehicle Spacing")
+        self.root.geometry("1280x820")
+        self.root.minsize(1040, 660)
         self.root.configure(bg=Theme.BG)
 
-        self.topbar = TopBar(self.root, model_name=self.model_name)
-        self.topbar.pack(fill="x")
+        # ── Header ──────────────────────────────────────────────────────────
+        header = tk.Frame(self.root, bg=Theme.TOPBAR, height=50)
+        header.pack(fill="x"); header.pack_propagate(False)
+        tk.Label(header, text="LANE", bg=Theme.TOPBAR, fg=Theme.CYAN,
+                 font=("Segoe UI", 14, "bold")).pack(side="left", padx=(16, 0))
+        tk.Label(header, text="DISTANCE", bg=Theme.TOPBAR, fg=Theme.TEXT_2,
+                 font=("Segoe UI", 14)).pack(side="left", padx=(4, 0))
+        GlowButton(header, "⊕ OPEN VIDEO", self._open_video,
+                   accent=Theme.CYAN, width=130, height=34).pack(
+            side="left", padx=16, pady=8)
+        self.lbl_status = tk.Label(header, text="Open a video to begin",
+                                   bg=Theme.TOPBAR, fg=Theme.TEXT_3,
+                                   font=Theme.F_MONO_S)
+        self.lbl_status.pack(side="right", padx=16)
+        self.lbl_tracked = tk.Label(header, text="● ByteTrack",
+                                    bg=Theme.TOPBAR, fg=Theme.SUCCESS,
+                                    font=Theme.F_MONO_S)
+        self.lbl_tracked.pack(side="right", padx=8)
         tk.Frame(self.root, bg=Theme.DIVIDER, height=1).pack(fill="x")
 
         self.toast = ToastManager(self.root)
 
-        middle = tk.Frame(self.root, bg=Theme.BG)
-        middle.pack(fill="both", expand=True)
+        body = tk.Frame(self.root, bg=Theme.BG)
+        body.pack(fill="both", expand=True)
 
-        self.sidebar = SidebarNav(middle, self._navigate)
-        self.sidebar.pack(side="left", fill="y")
-        tk.Frame(middle, bg=Theme.DIVIDER, width=1).pack(side="left", fill="y")
-
-        self.content = tk.Frame(middle, bg=Theme.BG)
-        self.content.pack(side="left", fill="both", expand=True)
-
-        tk.Frame(self.root, bg=Theme.DIVIDER, height=1).pack(fill="x", side="bottom")
-        self.playbar = PlaybackBar(self.root, self)
-        self.playbar.pack(fill="x", side="bottom")
-
-        self._panels: dict = {
-            "dashboard": DashboardPanel(self.content, self),
-            "detection": DetectionPanel(self.content, self),
-            "analytics": AnalyticsPanel(self.content, self),
-            "proximity": ProximityPanel(self.content, self),
-            "settings":  SettingsPanel(self.content, self),
-            "export":    ExportPanel(self.content, self),
-        }
-        for panel in self._panels.values():
-            panel.place(relx=0, rely=0, relwidth=1, relheight=1)
-
-        self._navigate("dashboard")
-
-        self.canvas = self._panels["dashboard"].video.canvas
-        self.canvas.bind("<ButtonPress-1>",  self._canvas_click)
-        self.canvas.bind("<Motion>",         self._canvas_motion)
-        self.canvas.bind("<ButtonPress-3>",  self._canvas_rclick)
+        # ── Video (left) ────────────────────────────────────────────────────
+        self.video = VideoPanel(body)
+        self.video.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self.canvas = self.video.canvas
+        self.canvas.bind("<ButtonPress-1>",   self._canvas_click)
+        self.canvas.bind("<Motion>",          self._canvas_motion)
+        self.canvas.bind("<B1-Motion>",       self._canvas_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
+        self.canvas.bind("<ButtonPress-3>",   self._canvas_rclick)
+        self.canvas.bind("<Double-Button-1>", self._canvas_dblclick)
         self.canvas.bind("<Configure>",
                          lambda _: self._render() if self._last_frame is not None else None)
 
-    def _navigate(self, key: str):
-        self._active_panel = key
-        for k, p in self._panels.items():
-            (p.lift if k == key else p.lower)()
-        if key == "analytics":
-            self._panels["analytics"].refresh(
-                self.results, self._session_start, self.var_limit.get())
-        if key == "export":
-            self._panels["export"].refresh(self.results, self.var_limit.get())
+        # ── Controls (right) ────────────────────────────────────────────────
+        right = tk.Frame(body, bg=Theme.BG, width=300)
+        right.pack(side="right", fill="y", pady=8, padx=(0, 8))
+        right.pack_propagate(False)
+        self._build_controls(right)
 
-    # ── 60-fps UI refresh ─────────────────────────────────────────────────────
-    def _ui_loop(self):
-        if self._last_tracks:
-            speeds = [t.speed_kmh for t in self._last_tracks if t.speed_kmh > 1]
-            avg = np.mean(speeds) if speeds else 0
-            self._panels["dashboard"].update_cards(
-                self._total, avg, self._violations, self._current_fps())
-            self.topbar.set_tracks(len(self._last_tracks))
-        self.root.after(33, self._ui_loop)
+        # ── Playback bar (bottom) ───────────────────────────────────────────
+        tk.Frame(self.root, bg=Theme.DIVIDER, height=1).pack(fill="x")
+        bar = tk.Frame(self.root, bg=Theme.SURFACE, height=52)
+        bar.pack(fill="x"); bar.pack_propagate(False)
+        self.btn_play = GlowButton(bar, "▶  START", self._toggle_play,
+                                   accent=Theme.SUCCESS, width=110, height=34)
+        self.btn_play.pack(side="left", padx=10, pady=9)
+        self.lbl_time = tk.Label(bar, text="0:00 / 0:00", bg=Theme.SURFACE,
+                                 fg=Theme.TEXT_3, font=Theme.F_MONO_S)
+        self.lbl_time.pack(side="left", padx=6)
+        style = ttk.Style(); style.theme_use("clam")
+        style.configure("Dark.Horizontal.TScale",
+                        troughcolor=Theme.SURFACE2, background=Theme.SURFACE,
+                        darkcolor=Theme.CYAN, lightcolor=Theme.CYAN,
+                        sliderlength=14, sliderthickness=14)
+        self.slider = ttk.Scale(bar, from_=0, to=100, orient="horizontal",
+                                command=self._seek, style="Dark.Horizontal.TScale")
+        self.slider.pack(side="left", fill="x", expand=True, padx=12)
 
-    def _current_fps(self) -> float:
-        if len(self._ftimes) < 2:
-            return 0.0
-        dts = [self._ftimes[i+1] - self._ftimes[i]
-               for i in range(len(self._ftimes) - 1)
-               if self._ftimes[i+1] > self._ftimes[i]]
-        return (1.0 / (sum(dts) / len(dts))) if dts else 0.0
+        # ── Keyboard shortcuts ──────────────────────────────────────────────
+        self.root.bind("<space>",  lambda _e: self._toggle_play())
+        self.root.bind("<Escape>", lambda _e: self._cancel_roi_mode())
+        self.root.bind("<Delete>", lambda _e: self._roi_delete())
+        self.root.bind("<d>",      lambda _e: self._roi_add())
+        self.root.bind("<g>",      lambda _e: self._toggle_grid())
+
+    def _build_controls(self, parent):
+        # Calibration
+        cal = tk.Frame(parent, bg=Theme.SURFACE, padx=12, pady=10)
+        cal.pack(fill="x", pady=(0, 8))
+        section_label(cal, "LANE CALIBRATION (ALL ROIs)", bg=Theme.SURFACE)
+        divider(cal, bg=Theme.SURFACE)
+        fields = tk.Frame(cal, bg=Theme.SURFACE)
+        fields.pack(fill="x", pady=8)
+        param_row(fields, "Length (m)", self.var_lane_len, bg=Theme.SURFACE)
+        param_row(fields, "Width (m)",  self.var_lane_wid, bg=Theme.SURFACE)
+        fields2 = tk.Frame(cal, bg=Theme.SURFACE)
+        fields2.pack(fill="x", pady=(0, 6))
+        param_row(fields2, "Safe gap (m)", self.var_safe_gap, bg=Theme.SURFACE)
+        self.btn_grid = GlowButton(cal, "▦ VERIFY GRID", self._toggle_grid,
+                                   accent=Theme.CYAN, height=30)
+        self.btn_grid.pack(fill="x", pady=(2, 4))
+        tk.Label(cal, text="Length & width apply to every ROI. Trace each lane's\n"
+                           "4 corners, then VERIFY GRID — the 5 m grid should\n"
+                           "line up with road markings on the selected ROI.",
+                 bg=Theme.SURFACE, fg=Theme.TEXT_3, font=Theme.F_CAP,
+                 justify="left").pack(anchor="w")
+
+        # ROI tools — multi-ROI list + add/edit/delete
+        roi = tk.Frame(parent, bg=Theme.SURFACE, padx=12, pady=10)
+        roi.pack(fill="x", pady=(0, 8))
+        section_label(roi, "ROAD LANE ROIs", bg=Theme.SURFACE)
+        divider(roi, bg=Theme.SURFACE)
+        lb_wrap = tk.Frame(roi, bg=Theme.SURFACE2)
+        lb_wrap.pack(fill="x", pady=(6, 4))
+        self.roi_list = tk.Listbox(
+            lb_wrap, height=4, bg=Theme.SURFACE2, fg=Theme.TEXT_2,
+            font=Theme.F_MONO_S, bd=0, highlightthickness=0,
+            selectbackground=Theme.SURFACE3, selectforeground=Theme.CYAN,
+            activestyle="none", exportselection=False)
+        self.roi_list.pack(side="left", fill="x", expand=True)
+        self.roi_list.bind("<<ListboxSelect>>", self._on_roi_select)
+        self.btn_add = GlowButton(roi, "✚ ADD ROI", self._roi_add,
+                                  accent=Theme.PURPLE, height=32)
+        self.btn_add.pack(fill="x", pady=2)
+        self.btn_edit = GlowButton(roi, "✎ EDIT POINTS", self._roi_toggle_edit,
+                                   accent=Theme.WARNING, height=32)
+        self.btn_edit.pack(fill="x", pady=2)
+        GlowButton(roi, "✕ DELETE ROI", self._roi_delete,
+                   accent=Theme.DANGER, height=32).pack(fill="x", pady=2)
+
+        # Lane traffic: count + avg speed (for the selected ROI)
+        traf = tk.Frame(parent, bg=Theme.SURFACE, padx=12, pady=10)
+        traf.pack(fill="x", pady=(0, 8))
+        section_label(traf, "LANE TRAFFIC", bg=Theme.SURFACE)
+        divider(traf, bg=Theme.SURFACE)
+        self.lbl_traffic_lane = tk.Label(traf, text="— no ROI selected —",
+                                         bg=Theme.SURFACE, fg=Theme.TEXT_3,
+                                         font=Theme.F_MONO_S)
+        self.lbl_traffic_lane.pack(anchor="w", pady=(4, 0))
+        grid = tk.Frame(traf, bg=Theme.SURFACE)
+        grid.pack(fill="x", pady=(6, 0))
+        c1 = tk.Frame(grid, bg=Theme.SURFACE)
+        c1.pack(side="left", expand=True, fill="x")
+        tk.Label(c1, text="VEHICLES", bg=Theme.SURFACE, fg=Theme.TEXT_3,
+                 font=Theme.F_CAP).pack(anchor="w")
+        self.lbl_count = tk.Label(c1, text="0", bg=Theme.SURFACE, fg=Theme.CYAN,
+                                  font=("Segoe UI", 22, "bold"))
+        self.lbl_count.pack(anchor="w")
+        c2 = tk.Frame(grid, bg=Theme.SURFACE)
+        c2.pack(side="left", expand=True, fill="x")
+        tk.Label(c2, text="AVG SPEED", bg=Theme.SURFACE, fg=Theme.TEXT_3,
+                 font=Theme.F_CAP).pack(anchor="w")
+        self.lbl_avg_speed = tk.Label(c2, text="— km/h", bg=Theme.SURFACE,
+                                      fg=Theme.SUCCESS, font=("Segoe UI", 22, "bold"))
+        self.lbl_avg_speed.pack(anchor="w")
+
+        # Latest record
+        res = tk.Frame(parent, bg=Theme.SURFACE, padx=12, pady=10)
+        res.pack(fill="x", pady=(0, 8))
+        section_label(res, "LATEST RECORD (GAP TO NEXT)", bg=Theme.SURFACE)
+        divider(res, bg=Theme.SURFACE)
+        self.lbl_dist = tk.Label(res, text="—", bg=Theme.SURFACE, fg=Theme.CYAN,
+                                 font=("Segoe UI", 28, "bold"))
+        self.lbl_dist.pack(anchor="w", pady=(6, 0))
+        self.lbl_pair = tk.Label(res, text="no record yet", bg=Theme.SURFACE,
+                                 fg=Theme.TEXT_3, font=Theme.F_MONO_S)
+        self.lbl_pair.pack(anchor="w")
+
+        # History
+        hist = tk.Frame(parent, bg=Theme.SURFACE, padx=12, pady=10)
+        hist.pack(fill="both", expand=True)
+        section_label(hist, "MEASUREMENT HISTORY", bg=Theme.SURFACE)
+        divider(hist, bg=Theme.SURFACE)
+        inner = tk.Frame(hist, bg=Theme.SURFACE2)
+        inner.pack(fill="both", expand=True, pady=6)
+        self.hist = tk.Text(inner, bg=Theme.SURFACE2, fg=Theme.TEXT_2,
+                            font=Theme.F_MONO_S, bd=0, state="disabled",
+                            wrap="none", height=6)
+        sb = tk.Scrollbar(inner, command=self.hist.yview,
+                          bg=Theme.SURFACE2, troughcolor=Theme.SURFACE, width=8)
+        self.hist.config(yscrollcommand=sb.set)
+        self.hist.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        GlowButton(parent, "⊞  EXPORT EXCEL", self._export_excel,
+                   accent=Theme.SUCCESS, height=36).pack(fill="x", pady=(8, 0))
 
     # ── Video open ────────────────────────────────────────────────────────────
     def _open_video(self):
@@ -254,33 +284,28 @@ class SpeedAnalyzerModern:
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         self.video_name = os.path.basename(path)
         total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.playbar.slider.configure(to=max(1, total - 1))
-        self.playbar.set_time(0, total / self.fps)
-        self.tracker   = Tracker(self.fps, self.cam)
-        self.results   = []; self.recorded_ids = set(); self._cross_flash = {}
-        self._total    = 0;  self._violations = 0
-        self._prox_zone      = []; self._prox_zone_mask = None
-        self._prox_log       = []; self._prox_log_counter = 0
-        self._last_following = []
-        self._exporter.reset()
-        self.prox_analytics.reset(); self.heatmap.reset()
-        self._panels["dashboard"].chart.reset()
+        self.slider.configure(to=max(1, total - 1))
+        # Reset session
+        self.yolo_det.reset()                     # forget ByteTrack IDs
+        self.exporters = {}
+        self._clear_hist()
+        self._last_tracks = []; self._inside_ids = []
+        self._speeds = {}; self._nexts = {}; self._lanes_live = {}
+        self.rois.clear(); self._roi_draft = []; self._roi_mode = None
+        self._roi_tmp = None; self._drag_idx = None
+        self.lbl_dist.config(text="—"); self.lbl_pair.config(text="no record yet")
+        self.lbl_count.config(text="0"); self.lbl_avg_speed.config(text="— km/h")
+        self.lbl_traffic_lane.config(text="— no ROI selected —")
+        self._refresh_roi_list()
         ok, f = self.cap.read()
         if ok:
-            self._last_frame  = f
-            self._last_tracks = []
-            self._panels["dashboard"].video.set_has_frame()
+            self._last_frame = f
+            self.video.set_has_frame()
             self._render()
-            # Auto-define default crossline at 60% frame height if none active
-            if not self.cross_line.active:
-                fh, fw = f.shape[:2]
-                y0 = int(fh * 0.60)
-                self.cross_line.define([0, y0], [fw, y0])
-                self.cross_line.set_width(self.var_lane_hw.get())
-        self.root.title(f"Speed Analyzer Pro — {self.video_name}")
-        self.topbar.set_status("IDLE")
-        self.topbar.set_model(self.model_name or "BG MODE")
-        self.toast.show(f"Opened: {self.video_name}", "info")
+        self._set_time(0, total / self.fps)
+        self._status(f"{self.video_name} — add a lane ROI to begin")
+        self.toast.show("Add a road-lane ROI (you can add several), then Start.", "info")
+        self._roi_add()
 
     # ── Playback ──────────────────────────────────────────────────────────────
     def _toggle_play(self):
@@ -292,29 +317,42 @@ class SpeedAnalyzerModern:
             self._start_play()
 
     def _start_play(self):
+        # Mandatory ROI gate — need at least one finished lane polygon.
+        lanes = self.rois.valid_lanes()
+        if not lanes:
+            self.toast.show("Add at least one lane ROI before processing.", "warning")
+            self._roi_add()
+            return
+        # Calibrate every lane from its corners + the shared lane dimensions.
+        ready = [l for l in lanes
+                 if l.calib.calibrate(l.roi.points,
+                                      self.var_lane_wid.get(),
+                                      self.var_lane_len.get())]
+        if not ready:
+            self.toast.show("Calibration failed — need valid lane polygons.", "error")
+            return
+
         self.playing = True
-        self.playbar.set_playing(True)
-        self.topbar.set_status("PLAYING")
+        self._roi_mode = None
+        self.btn_edit.set_active(False)
+        self.btn_play.update_text("⏸  STOP", accent=Theme.WARNING)
+        self._status(f"PROCESSING… {len(ready)} ROI(s)")
         for q in (self.in_q, self.out_q):
             while not q.empty():
                 try: q.get_nowait()
                 except queue.Empty: break
-        if self.tracker is None:
-            self.tracker = Tracker(self.fps, self.cam)
-        self.tracker.reset()
-        self.stabilizer.reset()
-        self.bg_det = BGDetector(self.var_min_a.get(), self.var_max_a.get())
-        self.worker = Worker(self.yolo_det, self.bg_det, self.enhancer,
-                             self.tracker, self.in_q, self.out_q,
-                             cross_line=self.cross_line,
-                             prox_zone=self._prox_zone_mask,
-                             prox_calc=self.prox_calc,
-                             prox_analytics=self.prox_analytics,
-                             prox_area_m2=self._prox_zone_area_m2,
-                             following_calc=self.following_calc,
-                             crossing_calc=self.crossing_calc,
-                             speed_event=self._speed_event,
-                             dist_event=self._dist_event)
+        self.yolo_det.reset()                     # restart ByteTrack IDs from 1
+        self._speeds = {}; self._nexts = {}; self._inside_ids = []; self._lanes_live = {}
+        self.lbl_count.config(text="0"); self.lbl_avg_speed.config(text="— km/h")
+
+        # Fresh auto-save file PER lane for this run.
+        self.exporters = {}
+        for lane in ready:
+            ex = DistanceExporter()
+            ex.set_auto_path(os.path.join(EXPORT_DIR, make_filename(lane.name)))
+            self.exporters[lane.name] = ex
+
+        self.worker = Worker(self.yolo_det, self.in_q, self.out_q, ready, self.fps)
         self.worker.start()
         self.cap_thread = threading.Thread(target=self._cap_loop, daemon=True)
         self.cap_thread.start()
@@ -324,8 +362,8 @@ class SpeedAnalyzerModern:
         if not self.playing:
             return
         self.playing = False
-        self.playbar.set_playing(False)
-        self.topbar.set_status("IDLE")
+        self.btn_play.update_text("▶  START", accent=Theme.SUCCESS)
+        self._status("IDLE")
         try:
             self.in_q.put_nowait(None)
         except queue.Full:
@@ -333,29 +371,24 @@ class SpeedAnalyzerModern:
         if self.worker:
             self.worker.stop()
             self.worker = None
-        if self.var_autosave.get() and self.results:
-            self._export_unified(auto=True)
 
     def _cap_loop(self):
-        interval = 1.0 / self.fps
-        t_next   = time.perf_counter() + interval
+        # Lossless: block until the worker has room so EVERY frame is tracked.
+        # ByteTrack's motion model needs consecutive frames for stable IDs, so we
+        # never drop frames — playback runs as fast as the worker can keep up.
         while self.playing:
             ok, frame = self.cap.read()
             if not ok:
                 try: self.in_q.put(None, timeout=1.0)
                 except queue.Full: pass
                 break
-            stab_frame, dx, dy, _ = self.stabilizer.process(frame)
-            self._stab_dx, self._stab_dy = dx, dy
-            try:
-                fid = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-                self.in_q.put_nowait((fid, stab_frame))
-            except queue.Full:
-                pass
-            sleep_t = t_next - time.perf_counter()
-            if sleep_t > 0:
-                time.sleep(sleep_t)
-            t_next += interval
+            fid = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            while self.playing:
+                try:
+                    self.in_q.put((fid, frame), timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
 
     def _schedule_poll(self):
         delay = max(8, int(1000.0 / self.fps))
@@ -366,9 +399,8 @@ class SpeedAnalyzerModern:
             return
         latest_frame  = None
         latest_tracks = None
-        all_finished:  list = []
-        all_crossings: list = []
-
+        latest_lanes  = None
+        records: list = []
         try:
             while True:
                 item = self.out_q.get_nowait()
@@ -376,396 +408,278 @@ class SpeedAnalyzerModern:
                     self._stop_play()
                     self.toast.show("Video finished.", "info")
                     return
-                frame_d, tracks_d, finished_d, crossings_d, following_d = item
+                frame_d, tracks_d, lanes_d = item
                 latest_frame  = frame_d
                 latest_tracks = tracks_d
-                all_finished.extend(finished_d)
-                all_crossings.extend(crossings_d)
-                self._last_following = following_d
+                latest_lanes  = lanes_d
+                for lane in lanes_d:
+                    records.extend(lane["records"])
         except queue.Empty:
             pass
 
         if latest_frame is not None:
             self._last_frame  = latest_frame
             self._last_tracks = latest_tracks
-
-            # Heatmap update (all tracks, every frame, main thread only)
-            if self._last_tracks:
-                fh, fw = self._last_frame.shape[:2]
-                self.heatmap.update(self._last_tracks, fw, fh)
-
-            # Proximity panel refresh at ~5 fps to avoid TK widget churn
-            now_t = time.perf_counter()
-            if now_t - self._prox_refresh_t > 0.20:
-                self._last_prox_snap = self.prox_analytics.snapshot
-                self._panels["proximity"].refresh(self._last_prox_snap)
-                self._prox_refresh_t = now_t
-
-            # Proximity log entry every PROX_LOG_INTERVAL frames
-            self._prox_log_counter += 1
-            if (self._prox_log_counter % PROX_LOG_INTERVAL == 0
-                    and self._last_prox_snap["count"] > 0):
-                entry = {
-                    "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "vehicles":    self._last_prox_snap["count"],
-                    "min_m":       round(self._last_prox_snap["min_m"],  1),
-                    "max_m":       round(self._last_prox_snap["max_m"],  1),
-                    "avg_m":       round(self._last_prox_snap["avg_m"],  1),
-                    "congestion":  round(self._last_prox_snap["congestion"], 1),
-                    "density":     round(self._last_prox_snap["density"],    2),
-                }
-                self._prox_log.append(entry)
-
-            if all_crossings:
-                for ev in all_crossings:
-                    if ev["dir"] == "IN":
-                        self.cross_line.count_in  += 1
-                    else:
-                        self.cross_line.count_out += 1
-                    self.cross_line.events.append(ev)
-                    self._record_crossing(ev)
-                    self._cross_flash[ev["id"]] = {
-                        "speed": ev["speed"], "dir": ev["dir"],
-                        "cx":    ev["cx"],    "cy":  ev["cy"],
-                        "t0":    time.perf_counter(),
-                    }
-                self._panels["dashboard"].update_crossing(
-                    self.cross_line.count_in, self.cross_line.count_out)
-
-            if latest_tracks:
-                spd = max((t.speed_kmh for t in latest_tracks), default=0)
-                if spd > 1:
-                    self._panels["dashboard"].chart.push(spd, self.var_limit.get())
-
-            self._update_fps()
-            self._panels["dashboard"].video.set_has_frame()
-
-        if self._last_frame is not None:
+            self._lanes_live  = {l["name"]: l for l in (latest_lanes or [])}
+            # Merge per-lane live data for rendering (union of inside ids etc.).
+            merged_inside: list = []
+            merged_speeds: dict = {}
+            merged_nexts:  dict = {}
+            for l in (latest_lanes or []):
+                merged_inside.extend(l["inside_ids"])
+                merged_speeds.update(l["speeds"])
+                merged_nexts.update(l["nexts"])
+            self._inside_ids = merged_inside
+            self._speeds     = merged_speeds
+            self._nexts      = merged_nexts
+            self._refresh_traffic()
+            for r in records:
+                self._record_vehicle(r)
+            self.video.set_has_frame()
             self._render()
             if self.cap:
                 pos   = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
                 total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 self._slider_busy = True
                 try:
-                    self.playbar.slider.set(pos)
-                    self.playbar.set_time(pos / self.fps, total / self.fps)
+                    self.slider.set(pos)
+                    self._set_time(pos / self.fps, total / self.fps)
                 finally:
                     self._slider_busy = False
-
         self._schedule_poll()
 
-    def _update_fps(self):
-        self._ftimes.append(time.perf_counter())
-        self.topbar.set_fps(self._current_fps())
+    def _refresh_traffic(self):
+        lane = self.rois.current()
+        live = self._lanes_live.get(lane.name) if lane else None
+        if live is not None:
+            self.lbl_traffic_lane.config(text=f"{lane.name}")
+            self.lbl_count.config(text=str(live["count"]))
+            moving = [s for s in live["speeds"].values() if s > 1]
+            self.lbl_avg_speed.config(
+                text=f"{sum(moving) / len(moving):.0f} km/h" if moving else "— km/h")
+        else:
+            total = sum(l["count"] for l in self._lanes_live.values())
+            self.lbl_traffic_lane.config(
+                text=lane.name if lane else "— no ROI selected —")
+            self.lbl_count.config(text=str(total))
+            self.lbl_avg_speed.config(text="— km/h")
+        self.lbl_tracked.config(
+            text=f"● tracked {len(self._last_tracks)} / ROIs {len(self.rois)}")
 
-    def _record_crossing(self, ev: dict):
-        track_id = ev["id"]
-        if track_id in self.recorded_ids:
+    def _record_vehicle(self, r: dict):
+        ex = self.exporters.get(r["roi"])
+        if ex is not None:
+            ex.add(r["id"], r["speed"], r["dist_m"], r["next_id"], r["vtime"])
+        gap_txt = f"{r['dist_m']:.1f} m" if r["dist_m"] is not None else "—"
+        nxt_txt = f"→ #{r['next_id']}" if r["next_id"] is not None else "(lead)"
+        self.lbl_dist.config(text=gap_txt)
+        self.lbl_pair.config(
+            text=f"{r['roi']}  #{r['id']}  {r['speed']:.0f} km/h   {nxt_txt}")
+        self._append_hist(f"[{r['vtime']}] {r['roi']:>6} #{r['id']:>3} "
+                          f"{r['speed']:>3.0f} km/h {nxt_txt:>7} {gap_txt:>7}\n")
+
+    # ── ROI list / selection ────────────────────────────────────────────────────
+    def _refresh_roi_list(self):
+        self.roi_list.delete(0, "end")
+        for lane in self.rois.lanes:
+            n = len(lane.roi.points)
+            tag = f"{n} pts" if lane.valid else "drawing…"
+            self.roi_list.insert("end", f"{lane.name}  ({tag})")
+        sel = self.rois.selected
+        if 0 <= sel < len(self.rois.lanes):
+            self.roi_list.selection_clear(0, "end")
+            self.roi_list.selection_set(sel)
+            self.roi_list.see(sel)
+
+    def _on_roi_select(self, _e):
+        sel = self.roi_list.curselection()
+        if not sel:
             return
-        self.recorded_ids.add(track_id)
-        speed = ev["speed"]
-        limit = self.var_limit.get()
-        self._total += 1
-        if speed > limit:
-            self._violations += 1
-            if speed > limit * 1.3:
-                self.toast.show(f"Speed Alert: #{track_id}  {speed:.0f} km/h",
-                                "error", duration=4000)
-        record = {
-            "id":        track_id,
-            "speed_kmh": round(speed, 1),
-            "cross_dir": ev["dir"],
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "video":     self.video_name,
-        }
-        self.results.append(record)
-        self._panels["dashboard"].log_detection(track_id, speed, ev["dir"], limit)
-
-        dist_result = ev.get("crossing_dist")
-        self._exporter.append(record, dist_result, limit)
-
-    # ── Step / seek ───────────────────────────────────────────────────────────
-    def _step(self, n: int):
-        if not self.cap:
+        idx = sel[0]
+        if idx == self.rois.selected:
             return
-        cur   = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-        total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(total - 1, cur + n)))
-        ok, f = self.cap.read()
-        if ok:
-            self._last_frame = f
-            self._panels["dashboard"].video.set_has_frame()
+        # Don't switch away from a polygon still being drawn — keep the draft.
+        if self._roi_mode == "draw":
+            self._refresh_roi_list()
+            return
+        if self._roi_mode == "edit":
+            self._roi_mode = None
+            self.btn_edit.set_active(False)
+        self.rois.select(idx)
+        # Show the newly-selected lane's grid preview / stats.
+        self._refresh_traffic()
+        self._render()
+
+    # ── ROI drawing / editing ──────────────────────────────────────────────────
+    def _roi_add(self):
+        if self._last_frame is None:
+            self.toast.show("Open a video file first.", "warning"); return
+        if self.playing:
+            self.toast.show("Stop processing before editing ROIs.", "warning"); return
+        # If a fresh, still-empty draft lane is selected, reuse it instead of
+        # stacking empty lanes.
+        cur = self.rois.current()
+        if not (self._roi_mode == "draw" and cur is not None and not cur.valid):
+            self.rois.add()
+        self._roi_mode  = "draw"
+        self._roi_draft = []
+        self._roi_tmp   = None
+        self._drag_idx  = None
+        self.btn_edit.set_active(False)
+        self._refresh_roi_list()
+        self.toast.show("Click the lane corners. Right-click / double-click to close.",
+                        "info")
+        self._render()
+
+    def _roi_toggle_edit(self):
+        if self.playing:
+            self.toast.show("Stop processing before editing ROIs.", "warning"); return
+        lane = self.rois.current()
+        if lane is None or not lane.valid:
+            self.toast.show("Select a finished ROI first.", "warning"); return
+        if self._roi_mode == "edit":
+            self._roi_mode = None
+            self.btn_edit.set_active(False)
+        else:
+            self._roi_mode = "edit"
+            self.btn_edit.set_active(True)
+            self.toast.show("Drag a vertex to move; right-click a vertex to delete.",
+                            "info")
+        self._render()
+
+    def _finalize_draft(self):
+        lane = self.rois.current()
+        if lane is None:
+            return
+        if (len(self._roi_draft) >= 2
+                and abs(self._roi_draft[-1][0] - self._roi_draft[-2][0]) < 4
+                and abs(self._roi_draft[-1][1] - self._roi_draft[-2][1]) < 4):
+            self._roi_draft.pop()
+        if len(self._roi_draft) < ROI_MIN_POINTS:
+            return
+        lane.roi.set_points(self._roi_draft)
+        self._roi_draft = []
+        self._roi_tmp   = None
+        self._roi_mode  = None
+        self._refresh_roi_list()
+        self._render()
+        self.toast.show(f"{lane.name} set. Add another ROI or press Start.", "success")
+        self._status(f"{self.video_name} — {len(self.rois.valid_lanes())} ROI(s) ready")
+
+    def _roi_delete(self):
+        if self.playing:
+            self.toast.show("Stop processing before editing ROIs.", "warning"); return
+        lane = self.rois.current()
+        if lane is None:
+            self.toast.show("No ROI selected to delete.", "warning"); return
+        name = lane.name
+        self.rois.remove_current()
+        self._roi_mode  = None
+        self._roi_draft = []
+        self._roi_tmp   = None
+        self.btn_edit.set_active(False)
+        self._refresh_roi_list()
+        self._render()
+        self.toast.show(f"{name} deleted.", "warning")
+
+    def _cancel_roi_mode(self):
+        if self._roi_mode is None:
+            return
+        # Abandoning a half-drawn polygon — drop the empty lane it created.
+        if self._roi_mode == "draw":
+            cur = self.rois.current()
+            if cur is not None and not cur.valid:
+                self.rois.remove_current()
+        self._roi_mode = None
+        self._roi_draft = []
+        self._roi_tmp = None
+        self.btn_edit.set_active(False)
+        self._refresh_roi_list()
+        if self._last_frame is not None:
             self._render()
-        pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-        self._slider_busy = True
-        try:
-            self.playbar.slider.set(pos)
-            self.playbar.set_time(pos / self.fps, total / self.fps)
-        finally:
-            self._slider_busy = False
 
+    def _toggle_grid(self):
+        new = not self.var_show_grid.get()
+        self.var_show_grid.set(new)
+        self.btn_grid.set_active(new)
+        lane = self.rois.current()
+        if new:
+            if lane is not None and lane.valid:
+                lane.calib.calibrate(lane.roi.points,
+                                     self.var_lane_wid.get(),
+                                     self.var_lane_len.get())
+            else:
+                self.toast.show("Select or draw a lane ROI first.", "warning")
+        if self._last_frame is not None:
+            self._render()
+
+    def _grab_radius(self) -> float:
+        return max(ROI_HANDLE_PX, 10.0 * self.sx)
+
+    def _canvas_click(self, e):
+        if self._last_frame is None:
+            return
+        vx, vy = self._c2v(e.x, e.y)
+        if self._roi_mode == "draw":
+            self._roi_draft.append([vx, vy]); self._render()
+        elif self._roi_mode == "edit":
+            lane = self.rois.current()
+            if lane is not None:
+                self._drag_idx = lane.roi.hit_point(vx, vy, self._grab_radius())
+
+    def _canvas_motion(self, e):
+        if self._last_frame is None:
+            return
+        vx, vy = self._c2v(e.x, e.y)
+        if self._roi_mode == "draw":
+            self._roi_tmp = [vx, vy]; self._render()
+        elif self._roi_mode == "edit" and self._drag_idx is not None:
+            lane = self.rois.current()
+            if lane is not None:
+                lane.roi.move_point(self._drag_idx, vx, vy); self._render()
+
+    def _canvas_release(self, _e):
+        self._drag_idx = None
+
+    def _canvas_rclick(self, e):
+        if self._roi_mode == "draw":
+            if len(self._roi_draft) >= ROI_MIN_POINTS:
+                self._finalize_draft()
+            else:
+                self._roi_draft = []; self._roi_tmp = None; self._render()
+        elif self._roi_mode == "edit":
+            lane = self.rois.current()
+            if lane is None:
+                return
+            vx, vy = self._c2v(e.x, e.y)
+            idx = lane.roi.hit_point(vx, vy, self._grab_radius())
+            if idx is not None:
+                if lane.roi.delete_point(idx):
+                    self._render(); self.toast.show("Vertex deleted.", "info")
+                else:
+                    self.toast.show("A polygon needs at least 3 points.", "warning")
+
+    def _canvas_dblclick(self, _e):
+        if self._roi_mode == "draw" and len(self._roi_draft) >= ROI_MIN_POINTS:
+            self._finalize_draft()
+
+    def _c2v(self, ex: int, ey: int):
+        return (max(0, min(int((ex - self.ox) * self.sx), 99999)),
+                max(0, min(int((ey - self.oy) * self.sy), 99999)))
+
+    # ── Seek ───────────────────────────────────────────────────────────────────
     def _seek(self, v):
-        if not self.cap or self._slider_busy:
+        if not self.cap or self._slider_busy or self.playing:
             return
         pos = int(float(v))
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
         ok, f = self.cap.read()
         if ok:
             self._last_frame = f
-            self._panels["dashboard"].video.set_has_frame()
+            self.video.set_has_frame()
             self._render()
-        if self.cap:
-            total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.playbar.set_time(pos / self.fps, total / self.fps)
-
-    # ── Canvas / line ────────────────────────────────────────────────────────
-    def _line_start(self):
-        self._drawing_line = True
-        self._line_p1      = None
-        self._line_tmp     = None
-        self.cross_line.clear()
-        self.cross_line.set_width(self.var_lane_hw.get())
-        self._panels["dashboard"].update_crossing(0, 0)
-        if self._last_frame is not None:
-            self._render()
-        self.toast.show("Click two points to define the counting line.", "info")
-
-    def _clear_line(self):
-        self.cross_line.clear()
-        self._drawing_line = False
-        self._line_p1 = self._line_tmp = None
-        self._panels["dashboard"].update_crossing(0, 0)
-        if self._last_frame is not None:
-            self._render()
-
-    def _canvas_click(self, e):
-        if self._last_frame is None:
-            return
-        vx, vy = self._c2v(e.x, e.y)
-        if self._drawing_line:
-            if self._line_p1 is None:
-                self._line_p1 = [vx, vy]
-            else:
-                self.cross_line.define(self._line_p1, [vx, vy])
-                self.cross_line.set_width(self.var_lane_hw.get())
-                self._drawing_line = False
-                self._line_p1      = None
-                self._line_tmp     = None
-                if self.worker:
-                    self.worker.set_cross_line(self.cross_line)
-                self._render()
-                hw = self.var_lane_hw.get()
-                self.toast.show(f"Counting line set  |  corridor ±{hw}px", "success")
-            return
-        if self._drawing_prox:
-            self._prox_zone.append([vx, vy])
-            self._render()
-
-    def _canvas_rclick(self, e):
-        if self._drawing_line:
-            self._drawing_line = False
-            self._line_p1 = self._line_tmp = None
-            self._render()
-            return
-        if self._drawing_prox and len(self._prox_zone) >= 3:
-            self._drawing_prox = False
-            self._prox_tmp     = None
-            fh, fw = self._last_frame.shape[:2]
-            mask = np.zeros((fh, fw), np.uint8)
-            cv2.fillPoly(mask, [np.array(self._prox_zone, np.int32)], 255)
-            self._prox_zone_mask = mask
-            # Estimate real-world area from polygon area in px → m²
-            area_px = float(cv2.contourArea(
-                np.array(self._prox_zone, np.int32).reshape(-1, 1, 2)))
-            px_m = max(self.var_prox_px_m.get(), 0.1)
-            self._prox_zone_area_m2 = area_px / (px_m * px_m)
-            if self.worker:
-                self.worker.set_prox_zone(mask, self._prox_zone_area_m2)
-            self._render()
-            self._navigate("proximity")
-            self.toast.show(
-                "Proximity zone set — play video to see analytics.", "success")
-
-    def _canvas_motion(self, e):
-        if self._last_frame is None:
-            return
-        vx, vy = self._c2v(e.x, e.y)
-        if self._drawing_line:
-            self._line_tmp = [vx, vy]
-            self._render()
-        elif self._drawing_prox:
-            self._prox_tmp = [vx, vy]
-            self._render()
-
-    def _c2v(self, ex: int, ey: int):
-        return (max(0, min(int((ex - self.ox) * self.sx), 9999)),
-                max(0, min(int((ey - self.oy) * self.sy), 9999)))
-
-    # ── Proximity zone drawing ────────────────────────────────────────────────
-
-    def _prox_start(self):
-        self._drawing_prox = True
-        self._drawing_line = False
-        self._prox_zone    = []
-        self._prox_tmp     = None
-        self.toast.show(
-            "Left-click to add proximity zone points. Right-click to finish.", "info")
-
-    def _clear_prox(self):
-        self._prox_zone      = []
-        self._prox_zone_mask = None
-        self._drawing_prox   = False
-        self._prox_tmp       = None
-        self._last_prox_snap = {
-            "pairs": [], "count": 0, "min_m": 0.0,
-            "max_m": 0.0, "avg_m": 0.0, "congestion": 0.0, "density": 0.0,
-        }
-        self.prox_analytics.reset()
-        if self.worker:
-            self.worker.set_prox_zone(None)
-        if self._last_frame is not None:
-            self._render()
-        self.toast.show("Proximity zone cleared.", "warning")
-
-    # ── Proximity settings ────────────────────────────────────────────────────
-
-    def _apply_prox_settings(self):
-        px_m = max(0.1, self.var_prox_px_m.get())
-        self.prox_calc.px_per_m      = px_m
-        self.following_calc.px_per_m = px_m
-        self.crossing_calc.px_per_m  = px_m
-        self.prox_analytics.safe_m    = self.var_safe_dist.get()
-        self.prox_analytics.warn_m    = self.var_warn_dist.get()
-        if self.var_use_birdseye.get() and self.birdseye.active:
-            self.prox_calc.set_birdseye(self.birdseye.M,
-                                        self.birdseye.px_per_m_out)
-            self.following_calc.set_birdseye(self.birdseye.M,
-                                             self.birdseye.px_per_m_out)
-            self.crossing_calc.set_birdseye(self.birdseye.M,
-                                            self.birdseye.px_per_m_x,
-                                            self.birdseye.px_per_m_y)
-        else:
-            self.prox_calc.set_birdseye(None, 0.0)
-            self.following_calc.set_birdseye(None, 0.0)
-            self.crossing_calc.set_birdseye(None, 1.0, 1.0)
-        # Recompute zone area with new px_m if zone exists
-        if len(self._prox_zone) >= 3:
-            area_px = float(cv2.contourArea(
-                np.array(self._prox_zone, np.int32).reshape(-1, 1, 2)))
-            self._prox_zone_area_m2 = area_px / (px_m * px_m)
-            if self.worker:
-                self.worker.set_prox_zone(self._prox_zone_mask,
-                                          self._prox_zone_area_m2)
-        self.toast.show("Proximity settings applied.", "success")
-
-    # ── Feature toggles ──────────────────────────────────────────────────────
-
-    def _toggle_speed(self):
-        if self._speed_event.is_set():
-            self._speed_event.clear()
-            self.playbar.btn_speed.set_active(False)
-        else:
-            self._speed_event.set()
-            self.playbar.btn_speed.set_active(True)
-
-    def _toggle_dist(self):
-        if self._dist_event.is_set():
-            self._dist_event.clear()
-            self.playbar.btn_dist.set_active(False)
-        else:
-            self._dist_event.set()
-            self.playbar.btn_dist.set_active(True)
-
-    # ── Bird's-eye calibration ────────────────────────────────────────────────
-
-    def _open_birdseye_calib(self):
-        if self._last_frame is None:
-            self.toast.show("Open a video file first.", "warning")
-            return
-        BirdseyeDialog(self.root, self._last_frame,
-                       callback=self._on_birdseye_calibrated)
-
-    def _on_birdseye_calibrated(self, src_pts, width_m: float, height_m: float):
-        self.birdseye.calibrate(src_pts, width_m, height_m)
-        self.var_use_birdseye.set(True)
-        self._apply_prox_settings()
-        self.toast.show(
-            f"Bird's-eye calibrated  {width_m}m × {height_m}m", "success")
-
-    # ── Proximity Excel export ────────────────────────────────────────────────
-
-    def _export_proximity_excel(self):
-        if not EXCEL_OK:
-            messagebox.showerror("Error", "openpyxl not installed."); return
-        if not self._prox_log:
-            self.toast.show("No proximity data recorded yet.", "warning"); return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx")],
-            initialfile=f"proximity_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
-        if not path:
-            return
-        try:
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Proximity Analytics"
-
-            hdr_fill = PatternFill("solid", fgColor="0D1526")
-            hdr_font = Font(bold=True, color="7C3AED", name="Consolas", size=10)
-            def_font = Font(name="Consolas", size=9)
-            center   = Alignment(horizontal="center")
-            thin     = Side(style="thin", color="1E3A5F")
-            border   = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-            headers = ["Timestamp", "Vehicles", "Min Dist (m)",
-                       "Max Dist (m)", "Avg Dist (m)", "Congestion %", "Density"]
-            col_w   = [22, 10, 14, 14, 14, 14, 14]
-            for ci, (h, w) in enumerate(zip(headers, col_w), 1):
-                c = ws.cell(row=1, column=ci, value=h)
-                c.fill = hdr_fill; c.font = hdr_font
-                c.alignment = center; c.border = border
-                ws.column_dimensions[get_column_letter(ci)].width = w
-
-            for ri, row in enumerate(self._prox_log, 2):
-                vals = [row["timestamp"], row["vehicles"],
-                        row["min_m"], row["max_m"], row["avg_m"],
-                        row["congestion"], row["density"]]
-                for ci, val in enumerate(vals, 1):
-                    c = ws.cell(row=ri, column=ci, value=val)
-                    c.font = def_font; c.alignment = center; c.border = border
-
-            wb.save(path)
-            self.toast.show(f"Proximity exported: {os.path.basename(path)}", "success")
-        except Exception as ex:
-            messagebox.showerror("Export Error", str(ex))
-
-    def _clear_all(self):
-        self._stop_play()
-        self._drawing_line = False
-        self._line_tmp     = None; self._line_p1 = None
-        self.cross_line.clear()
-        self._panels["dashboard"].update_crossing(0, 0)
-        self.tracker       = Tracker(self.fps, self.cam)
-        self.stabilizer.reset()
-        self.results       = []; self.recorded_ids = set()
-        self._cross_flash  = {}; self._total = 0; self._violations = 0
-        Track._next        = 1
-        self._panels["dashboard"].chart.reset()
-        # Proximity reset
-        self._prox_zone    = []; self._prox_zone_mask = None
-        self._drawing_prox = False; self._prox_tmp = None
-        self._prox_log        = []; self._prox_log_counter = 0
-        self._last_following = []
-        self._exporter.reset()
-        self.prox_analytics.reset()
-        self.heatmap.reset()
-        self._last_prox_snap = {
-            "pairs": [], "count": 0, "min_m": 0.0,
-            "max_m": 0.0, "avg_m": 0.0, "congestion": 0.0, "density": 0.0,
-        }
-        if self._last_frame is not None:
-            self._render()
-        self.toast.show("All data cleared.", "warning")
+        total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._set_time(pos / self.fps, total / self.fps)
 
     # ── Render ────────────────────────────────────────────────────────────────
     def _render(self):
@@ -782,113 +696,20 @@ class SpeedAnalyzerModern:
         self.ox = (cw - nw) // 2
         self.oy = (ch - nh) // 2
 
-        # Proximity zone (purple)
-        if len(self._prox_zone) >= 3:
-            ov = d.copy()
-            cv2.fillPoly(ov, [np.array(self._prox_zone, np.int32)], (100, 0, 160))
-            cv2.addWeighted(ov, 0.15, d, 0.85, 0, d)
-            cv2.polylines(d, [np.array(self._prox_zone, np.int32)],
-                          True, (180, 0, 255), 2)
-            cv2.putText(d, "PROX ZONE",
-                        (self._prox_zone[0][0] + 5, self._prox_zone[0][1] - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 0, 255), 1, cv2.LINE_AA)
-        elif self._prox_zone and self._drawing_prox:
-            for i, pt in enumerate(self._prox_zone):
-                cv2.circle(d, tuple(pt), 5, (180, 0, 255), -1)
-                if i > 0:
-                    cv2.line(d, tuple(self._prox_zone[i-1]), tuple(pt),
-                             (180, 0, 255), 2)
-            if self._prox_tmp:
-                cv2.line(d, tuple(self._prox_zone[-1]), tuple(self._prox_tmp),
-                         (180, 0, 255), 1)
+        self._draw_rois(d)
+        if self.var_show_grid.get():
+            lane = self.rois.current()
+            if not self.playing and lane is not None and lane.valid:   # live preview
+                lane.calib.calibrate(lane.roi.points, self.var_lane_wid.get(),
+                                     self.var_lane_len.get())
+            if lane is not None and lane.calib.ready:
+                self._draw_grid(d, lane.calib)
+        draw_tracks(d, self._last_tracks, self._inside_ids,
+                    speeds=self._speeds, show_outside=True)
+        self._draw_following(d)
 
-        # Heatmap (all tracks, blended under other overlays)
-        if self.var_show_heatmap.get():
-            self.heatmap.render(d)
-
-        self.cross_line.draw(d)
-        if self._drawing_line and self._line_p1 and self._line_tmp:
-            cv2.line(d, tuple(self._line_p1), tuple(self._line_tmp),
-                     (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.circle(d, tuple(self._line_p1), 5, (0, 200, 255), -1)
-
-        draw_tracks(d, self._last_tracks, 1.0,
-                    show_boxes=self.var_boxes.get(),
-                    show_speed=self.var_speed_lbl.get())
-
-        # Proximity distance lines
-        if self.var_show_dist.get() and self._last_prox_snap["pairs"]:
-            render_proximity_overlay(
-                d,
-                self._last_prox_snap["pairs"],
-                safe_m=self.var_safe_dist.get(),
-                warn_m=self.var_warn_dist.get(),
-                show_labels=self.var_show_labels.get(),
-            )
-
-        # Following-distance overlay: dashed arrow + gap label per track
-        if self._last_following:
-            track_pos = {t.id: (int(t.cx), int(t.cy)) for t in self._last_tracks}
-            for fr in self._last_following:
-                if fr.rear_vehicle_id is None or fr.distance_m is None:
-                    continue
-                pa = track_pos.get(fr.vehicle_id)
-                pb = track_pos.get(fr.rear_vehicle_id)
-                if pa is None or pb is None:
-                    continue
-                safe_m = self.var_safe_dist.get()
-                warn_m = self.var_warn_dist.get()
-                if fr.distance_m >= safe_m:
-                    color = (0, 220, 80)
-                elif fr.distance_m >= warn_m:
-                    color = (0, 200, 240)
-                else:
-                    color = (0, 60, 255)
-                cv2.arrowedLine(d, pb, pa, color, 1, cv2.LINE_AA, tipLength=0.2)
-                mx, my = (pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2
-                txt = f"{fr.distance_m:.1f}m"
-                cv2.putText(d, txt, (mx + 2, my - 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(d, txt, (mx + 2, my - 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, color, 1, cv2.LINE_AA)
-
-        if self.var_speed_lbl.get() and self._cross_flash:
-            now = time.perf_counter()
-            draw_cross_flash(d, self._cross_flash, 1.0,
-                             speed_limit=self.var_limit.get(), now=now)
-            self._cross_flash = {k: v for k, v in self._cross_flash.items()
-                                 if now - v["t0"] < 2.5}
-
-        stab_txt = (f"Stab dx={self._stab_dx:.1f} dy={self._stab_dy:.1f}"
-                    if self.stabilizer.enabled else "Stab: OFF")
-        cv2.putText(d, stab_txt, (8, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 160, 200), 1, cv2.LINE_AA)
-
-        # Proximity zone HUD (always visible on video when zone is set)
-        if self._prox_zone_mask is not None:
-            sn  = self._last_prox_snap
-            cnt = sn.get("count", 0)
-            avg = sn.get("avg_m", 0.0)
-            cng = sn.get("congestion", 0.0)
-            if cnt >= 2:
-                hud_color = (0, 220, 80) if avg >= self.var_safe_dist.get() else \
-                            (0, 200, 240) if avg >= self.var_warn_dist.get() else \
-                            (0, 60, 255)
-            else:
-                hud_color = (180, 0, 255)
-            hud_lines = [
-                f"ZONE  {cnt} veh",
-                f"Avg {avg:.1f}m" if cnt >= 2 else "Need 2+ veh",
-                f"Cong {cng:.0f}%"  if cnt >= 2 else "",
-            ]
-            for i, ln in enumerate(hud_lines):
-                if not ln:
-                    continue
-                yy = 42 + i * 17
-                cv2.putText(d, ln, (8, yy), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.42, (0, 0, 0),   2, cv2.LINE_AA)
-                cv2.putText(d, ln, (8, yy), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.42, hud_color,   1, cv2.LINE_AA)
+        if not self.playing and not self.rois.valid_lanes():
+            self._banner(d, "ADD A ROAD-LANE ROI TO BEGIN")
 
         if nw > 0 and nh > 0:
             disp = cv2.resize(d, (nw, nh), interpolation=cv2.INTER_LINEAR)
@@ -899,105 +720,132 @@ class SpeedAnalyzerModern:
                                      image=img, tags="frame")
             self.canvas._img_ref = img
 
-    # ── Camera model ──────────────────────────────────────────────────────────
-    def _apply_camera(self):
-        self.cam.speed_factor = max(0.01, self.var_speed_k.get())
-        if self.var_cam_on.get():
-            fw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))  if self.cap else 1280
-            fh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if self.cap else  720
-            self.cam.setup(self.var_cam_H.get(), self.var_cam_T.get(),
-                           self.var_cam_P.get(), self.var_cam_F.get(), fw, fh)
-            self.toast.show("Camera model enabled.", "success")
-        else:
-            self.cam.enabled = False
+    def _draw_rois(self, d):
+        editing = self._roi_mode in ("draw", "edit")
+        cur = self.rois.current()
+        for lane in self.rois.lanes:
+            if not lane.valid:
+                continue
+            is_cur = lane is cur
+            color  = lane.color
+            arr    = np.array(lane.roi.points, np.int32)
+            ov     = d.copy()
+            cv2.fillPoly(ov, [arr], color)
+            cv2.addWeighted(ov, 0.16 if is_cur else 0.10, d,
+                            0.84 if is_cur else 0.90, 0, d)
+            cv2.polylines(d, [arr], True, color, 3 if is_cur else 2, cv2.LINE_AA)
+            ax, ay = min(lane.roi.points, key=lambda p: p[1])
+            cv2.putText(d, lane.name, (ax + 6, max(16, ay - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(d, lane.name, (ax + 6, max(16, ay - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+            if editing and is_cur:
+                for (px, py) in lane.roi.points:
+                    cv2.circle(d, (px, py), 5, (255, 255, 255), -1, cv2.LINE_AA)
+                    cv2.circle(d, (px, py), 5, color, 1, cv2.LINE_AA)
+        # Draft polygon being drawn for the current lane.
+        if self._roi_mode == "draw" and self._roi_draft:
+            color = cur.color if cur is not None else ROI_COLOR
+            for i, pt in enumerate(self._roi_draft):
+                cv2.circle(d, tuple(pt), 5, color, -1, cv2.LINE_AA)
+                if i > 0:
+                    cv2.line(d, tuple(self._roi_draft[i-1]), tuple(pt),
+                             color, 2, cv2.LINE_AA)
+            if self._roi_tmp:
+                cv2.line(d, tuple(self._roi_draft[-1]), tuple(self._roi_tmp),
+                         color, 1, cv2.LINE_AA)
 
-    def _load_cam_json(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if not path:
+    def _gap_color(self, gap_m: float) -> tuple:
+        """Green/amber/red by following gap vs the safe threshold (BGR)."""
+        safe = self.var_safe_gap.get()
+        warn = max(WARN_GAP_M, safe * 0.5)
+        if gap_m >= safe:
+            return (0, 220, 80)
+        if gap_m >= warn:
+            return (0, 200, 240)
+        return (0, 60, 255)
+
+    def _draw_following(self, d):
+        """Live line from each in-lane vehicle to the vehicle ahead + gap label,
+        colour-coded by the safe-following-distance threshold."""
+        if not self._nexts or not self._last_tracks:
             return
-        try:
-            self.cam.load_json(path)
-            self.var_cam_H.set(self.cam.H)
-            self.var_cam_T.set(self.cam.tilt)
-            self.var_cam_P.set(self.cam.pan)
-            self.var_cam_F.set(self.cam.f)
-            self.var_cam_on.set(True)
-            self.toast.show("Camera JSON loaded.", "success")
-        except Exception as ex:
-            messagebox.showerror("Error", str(ex))
+        gp = {}
+        for t in self._last_tracks:
+            x, y, w, h = t.bbox
+            gp[t.id] = (int(x + w / 2), int(y + h))
+        for tid, (nid, gap) in self._nexts.items():
+            if nid is None or gap is None or tid not in gp or nid not in gp:
+                continue
+            pa, pb = gp[tid], gp[nid]
+            color = self._gap_color(gap)
+            cv2.line(d, pa, pb, color, 2, cv2.LINE_AA)
+            cv2.circle(d, pa, 4, color, -1, cv2.LINE_AA)
+            mx, my = (pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2
+            txt = f"{gap:.1f} m"
+            cv2.putText(d, txt, (mx + 4, my - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(d, txt, (mx + 4, my - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, color, 1, cv2.LINE_AA)
 
-    def _open_calibrator(self):
-        CalibratorWindow(self.root, callback=self._on_calib_result,
-                         frame_ref=self._last_frame)
+    def _draw_grid(self, d, calib):
+        """Metric grid over the selected lane to verify calibration vs markings."""
+        for (p1, p2, major) in calib.grid_segments(GRID_STEP_M):
+            cv2.line(d, p1, p2, (0, 210, 255) if major else (90, 160, 90),
+                     2 if major else 1, cv2.LINE_AA)
 
-    def _on_calib_result(self, params: dict):
-        self.cam.H    = params.get("camera_height_m",  self.cam.H)
-        self.cam.tilt = params.get("camera_pitch_deg", self.cam.tilt)
-        self.cam.f    = params.get("focal_length_px",  self.cam.f)
-        fw = params.get("frame_width",  1280)
-        fh = params.get("frame_height",  720)
-        self.cam.cx, self.cam.cy = fw / 2.0, fh / 2.0
-        if "px_per_m" in params:
-            self.cam.px_per_m = params["px_per_m"]
-        self.cam.enabled = True
-        self.var_cam_on.set(True)
-        self.var_cam_H.set(self.cam.H)
-        self.var_cam_T.set(self.cam.tilt)
-        self.var_cam_F.set(self.cam.f)
-        self.toast.show("Camera calibrated.", "success")
+    @staticmethod
+    def _banner(d, text):
+        fh, fw = d.shape[:2]
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        x = (fw - tw) // 2
+        y = int(fh * 0.12)
+        cv2.rectangle(d, (x - 16, y - th - 12), (x + tw + 16, y + 12), (0, 0, 0), -1)
+        cv2.rectangle(d, (x - 16, y - th - 12), (x + tw + 16, y + 12),
+                      (0, 200, 255), 1)
+        cv2.putText(d, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 200, 255), 2, cv2.LINE_AA)
 
-    def _load_model(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Model", "*.pt *.onnx *.engine"), ("All", "*.*")])
-        if not path:
-            return
-        self._stop_play()
-        det, name = load_yolo(path)
-        if det:
-            self.yolo_det   = det
-            self.model_name = name
-            self.topbar.set_model(name, ok=True)
-            det_panel = self._panels["detection"]
-            if hasattr(det_panel, "lbl_model"):
-                det_panel.lbl_model.config(text=name, fg=Theme.CYAN)
-            self.toast.show(f"Model loaded: {name}", "success")
-        else:
-            self.topbar.set_model("Load failed", ok=False)
-            self.toast.show("Failed to load model.", "error")
-
-    # ── Screenshot ────────────────────────────────────────────────────────────
-    def _take_screenshot(self):
-        if self._last_frame is None:
-            self.toast.show("No frame to capture.", "warning"); return
-        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(self.ssdir, f"screenshot_{ts}.png")
-        cv2.imwrite(path, self._last_frame)
-        self.toast.show(f"Screenshot saved: {path}", "success")
-
-    # ── Unified Excel export ───────────────────────────────────────────────────
-    def _export_unified(self, auto: bool = False):
-        if not TrafficReportExporter.available():
+    # ── Excel export ────────────────────────────────────────────────────────────
+    def _export_excel(self):
+        if not DistanceExporter.available():
             messagebox.showerror("Error", "openpyxl not installed."); return
-        if not self._exporter._rows:
-            if not auto:
-                self.toast.show("No crossing events to export.", "warning")
+        nonempty = {name: ex for name, ex in self.exporters.items() if ex.rows}
+        if not nonempty:
+            self.toast.show("No measurements to export yet.", "warning"); return
+        folder = filedialog.askdirectory(title="Choose a folder for the ROI files")
+        if not folder:
             return
-        if auto:
-            path = make_filename()
-        else:
-            path = filedialog.asksaveasfilename(
-                defaultextension=".xlsx",
-                filetypes=[("Excel", "*.xlsx")],
-                initialfile=make_filename())
-            if not path:
-                return
+        saved = 0
         try:
-            self._exporter.export(path, self.var_limit.get())
-            if not auto:
-                self.toast.show(f"Exported: {os.path.basename(path)}", "success")
+            for name, ex in nonempty.items():
+                ex.save(os.path.join(folder, make_filename(name)))
+                saved += 1
+            self.toast.show(f"Exported {saved} file(s) to {os.path.basename(folder)}.",
+                            "success")
         except Exception as ex:
-            if not auto:
-                messagebox.showerror("Export Error", str(ex))
+            messagebox.showerror("Export Error", str(ex))
+
+    # ── Small helpers ──────────────────────────────────────────────────────────
+    def _status(self, text):
+        self.lbl_status.config(text=text)
+
+    def _set_time(self, cur_s, total_s):
+        def fmt(s):
+            m, sec = divmod(int(s), 60)
+            return f"{m}:{sec:02d}"
+        self.lbl_time.config(text=f"{fmt(cur_s)} / {fmt(total_s)}")
+
+    def _append_hist(self, line):
+        self.hist.config(state="normal")
+        self.hist.insert("end", line)
+        self.hist.see("end")
+        self.hist.config(state="disabled")
+
+    def _clear_hist(self):
+        self.hist.config(state="normal")
+        self.hist.delete("1.0", "end")
+        self.hist.config(state="disabled")
 
     def mainloop(self):
         self.root.mainloop()

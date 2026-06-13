@@ -1,2 +1,1 @@
-"""UI dialogs package."""
-from ui.dialogs.calibrator import CalibratorWindow  # noqa: F401
+"""UI dialogs package — intentionally empty."""

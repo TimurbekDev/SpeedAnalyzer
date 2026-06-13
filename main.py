@@ -2,7 +2,7 @@
 """Entry point for Speed Analyzer."""
 
 import tkinter as tk
-from ui.app import SpeedAnalyzerModern
+from ui.app import LaneDistanceApp
 
 
 def main():
@@ -13,7 +13,7 @@ def main():
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
-    app = SpeedAnalyzerModern(root)
+    app = LaneDistanceApp(root)
     root.deiconify()
     root.mainloop()
 

@@ -1,69 +1,134 @@
 """
-Worker thread — consumes (fid, frame) from in_q, runs detect+track,
-pushes (frame, tracks, finished, crossings, following) to out_q.
+Worker thread — ByteTrack multi-lane distance pipeline.
 
-Thread-safe cross_line and proximity zone updates via Lock.
-Speed/distance processing gated by threading.Events set from the UI thread.
+    frame → detect+track ONCE on the whole frame (ByteTrack) → for EACH lane ROI:
+    keep the vehicles whose ground point is inside it → per-vehicle speed (metric)
+    + gap to the vehicle ahead → log each vehicle ONCE per lane → push to the UI.
+
+Why one track() call, many lanes
+─────────────────────────────────
+ByteTrack's frame-to-frame state lives inside the YOLO model.  Tracking the
+whole frame a single time per frame keeps that state consistent and gives every
+lane the SAME stable ids.  (Running one tracker per ROI — calling track() several
+times on the same model — corrupts that state and is what made vehicles lose
+their id and get logged twice.)  Lanes only *filter* the shared detections.
+
+Every frame handed to the worker is tracked (no frame-skip) so ByteTrack's motion
+model stays consistent.
 """
+
 import queue
 import threading
-import numpy as np
-from config.defaults import FRAME_SKIP
+
+from config.defaults import MEASURE_SPEED_GRACE_S
+from core.entities.vehicle import Vehicle
+from vision.pipeline.speed_tracker import MetricSpeedTracker
+
+
+class _LaneState:
+    """Per-lane measurement state (counts, recorded ids, speed history)."""
+
+    def __init__(self, lane):
+        self.lane     = lane            # vision.roi.Lane (roi + calib + name + color)
+        self.counted  = set()           # unique ids that entered this lane
+        self.recorded = set()           # ids already written to this lane's log
+        self.seen_fid = {}              # id -> first fid inside this lane
+        self.speed    = MetricSpeedTracker()
 
 
 class Worker(threading.Thread):
-    def __init__(self, yolo_det, bg_det, enhancer, tracker, in_q, out_q,
-                 cross_line=None,
-                 prox_zone=None, prox_calc=None,
-                 prox_analytics=None, prox_area_m2=5000.0,
-                 following_calc=None, crossing_calc=None,
-                 speed_event:   threading.Event | None = None,
-                 dist_event:    threading.Event | None = None):
+    def __init__(self, detector, in_q, out_q, lanes, fps: float):
         super().__init__(daemon=True)
-        self.yolo  = yolo_det
-        self.bg    = bg_det
-        self.enh   = enhancer
-        self.trk   = tracker
-        self.in_q  = in_q
-        self.out_q = out_q
-        self._stop = threading.Event()
-        self._fid  = 0
-        self._last_boxes: list              = []
-        self._cross_line                    = cross_line
-        self._prox_zone:  np.ndarray | None = prox_zone
-        self._prox_calc                     = prox_calc
-        self._prox_analytics                = prox_analytics
-        self._prox_area_m2: float           = prox_area_m2
-        self._following_calc                = following_calc
-        self._crossing_calc                 = crossing_calc
-        self._lock = threading.Lock()
+        self.det    = detector
+        self.in_q   = in_q
+        self.out_q  = out_q
+        self.fps    = max(1.0, float(fps))
+        self._states = [_LaneState(l) for l in lanes]
+        self._stop   = threading.Event()
 
-        # Feature gates — checked each frame without acquiring the main lock.
-        # Use threading.Event so the UI thread can toggle them safely at any time.
-        self._speed_en = speed_event or _AlwaysSet()
-        self._dist_en  = dist_event  or _AlwaysSet()
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    # ── Thread-safe setters ───────────────────────────────────────────────────
-
-    def set_cross_line(self, cl) -> None:
-        with self._lock:
-            self._cross_line = cl
-
-    def set_prox_zone(self, mask: np.ndarray | None,
-                      area_m2: float = 5000.0) -> None:
-        with self._lock:
-            self._prox_zone     = mask
-            self._prox_area_m2  = area_m2
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    def _vtime(self, fid: int) -> str:
+        secs = int(fid / self.fps)
+        return f"{secs // 60:02d}:{secs % 60:02d}"
 
     @staticmethod
-    def _in_roi(cx: float, cy: float, mask) -> bool:
-        if mask is None:
-            return False
-        xi, yi = int(cx), int(cy)
-        h, w = mask.shape[:2]
-        return 0 <= yi < h and 0 <= xi < w and mask[yi, xi] > 0
+    def _compute_nexts(inside: list, metric: dict, speed) -> dict:
+        """
+        For each in-lane vehicle, find the vehicle AHEAD of it and the metric gap.
+        "Ahead" = the half-plane the vehicle is travelling toward (its metric
+        velocity); the closest vehicle there is its follow target.  Falls back to
+        nearest neighbour when direction is unknown (just appeared / stopped).
+        Lead vehicle → (None, None).  Returns {id: (next_id, gap_m or None)}.
+        """
+        nexts: dict = {}
+        ids = [v.id for v in inside if v.id in metric]
+        for tid in ids:
+            px, py = metric[tid]
+            vel = speed.velocity(tid)
+            has_dir = vel is not None and (vel[0] ** 2 + vel[1] ** 2) > 1e-6
+            best_id, best_gap = None, float("inf")
+            for oid in ids:
+                if oid == tid:
+                    continue
+                ox, oy = metric[oid]
+                dx, dy = ox - px, oy - py
+                if has_dir and (dx * vel[0] + dy * vel[1]) <= 0.0:
+                    continue                      # behind, not ahead
+                gap = (dx * dx + dy * dy) ** 0.5
+                if gap < best_gap:
+                    best_gap, best_id = gap, oid
+            nexts[tid] = (best_id, best_gap if best_id is not None else None)
+        return nexts
+
+    def _process_lane(self, st: _LaneState, vehicles: list, fid: int, t_sec: float) -> dict:
+        """Filter the shared detections to one lane and produce its frame result."""
+        roi, calib = st.lane.roi, st.lane.calib
+        inside = [v for v in vehicles if roi.contains(*v.ground)]
+        inside.sort(key=lambda v: v.id)
+        inside_ids = [v.id for v in inside]
+
+        speeds: dict = {}
+        metric: dict = {}
+        for v in inside:
+            st.counted.add(v.id)
+            st.seen_fid.setdefault(v.id, fid)
+            if calib.ready:
+                xm, ym = calib.to_metric(v.ground)
+                metric[v.id] = (xm, ym)
+                speeds[v.id] = round(st.speed.update(v.id, xm, ym, t_sec), 1)
+            else:
+                speeds[v.id] = 0.0
+        st.speed.keep_only(inside_ids)
+
+        nexts = self._compute_nexts(inside, metric, st.speed)
+
+        records: list = []
+        for v in inside:
+            if v.id in st.recorded:
+                continue
+            sp = speeds.get(v.id, 0.0)
+            nid, gap = nexts.get(v.id, (None, None))
+            waited = (fid - st.seen_fid[v.id]) / self.fps
+            if sp > 1 and (gap is not None or waited >= MEASURE_SPEED_GRACE_S):
+                st.recorded.add(v.id)
+                records.append({
+                    "roi":     st.lane.name,
+                    "id":      v.id,
+                    "speed":   sp,
+                    "dist_m":  round(gap, 1) if gap is not None else None,
+                    "next_id": nid,
+                    "vtime":   self._vtime(fid),
+                })
+
+        return {
+            "name":       st.lane.name,
+            "inside_ids": inside_ids,
+            "speeds":     speeds,
+            "nexts":      nexts,
+            "count":      len(st.counted),
+            "records":    records,
+        }
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -76,62 +141,18 @@ class Worker(threading.Thread):
             if item is None:
                 self.out_q.put(None)
                 break
-
             fid, frame = item
-            enhanced   = self.enh.process(frame)
 
-            with self._lock:
-                cl   = self._cross_line
-                pz   = self._prox_zone
-                pc   = self._prox_calc
-                pa   = self._prox_analytics
-                pa2  = self._prox_area_m2
+            # ── Detect + track every vehicle in the frame ONCE (ByteTrack) ──
+            vehicles = [Vehicle(tid, (x, y, w, h))
+                        for (tid, x, y, w, h) in self.det.track(frame)]
+            t_sec = fid / self.fps
 
-            if self._fid % max(1, FRAME_SKIP) == 0:
-                if self.yolo and self.yolo.model:
-                    self._last_boxes = self.yolo.detect(enhanced)
-                else:
-                    self._last_boxes = self.bg.detect(enhanced)
-            self._fid += 1
+            # ── Distribute the shared detections to every lane ──────────────
+            lanes_out = [self._process_lane(st, vehicles, fid, t_sec)
+                         for st in self._states]
 
-            tracks   = self.trk.update(self._last_boxes, fid)
-            finished = self.trk.finished[:]
-            self.trk.finished.clear()
-
-            cam = self.trk.cam
-
-            # ── Speed calculation (gated) ──────────────────────────────────
-            if self._speed_en.is_set():
-                for t in tracks:
-                    t.calc_speed(cam)
-
-            # ── Crossing detection (always active) ─────────────────────────
-            crossings: list[dict] = []
-            if cl and cl.active:
-                for t in self.trk.tracks:
-                    ev = cl.check_track(t, fid, cam=cam)
-                    if ev:
-                        # Attach following distance only when dist module is on.
-                        if (self._dist_en.is_set()
-                                and self._crossing_calc is not None):
-                            ev["crossing_dist"] = self._crossing_calc.find_rear(
-                                ev, self.trk.tracks, cl)
-                        crossings.append(ev)
-
-            # ── Proximity analytics (gated) ────────────────────────────────
-            if self._dist_en.is_set() and pz is not None \
-                    and pc is not None and pa is not None:
-                zone_tracks = [t for t in self.trk.tracks
-                               if self._in_roi(t.cx, t.cy, pz)]
-                pairs = pc.compute(zone_tracks)
-                pa.update(pairs, len(zone_tracks), pa2)
-
-            # ── Following distance (gated) ─────────────────────────────────
-            following = (self._following_calc.compute(tracks)
-                         if self._dist_en.is_set()
-                         and self._following_calc is not None else [])
-
-            result = (enhanced, tracks, finished, crossings, following)
+            result = (frame, vehicles, lanes_out)
             try:
                 self.out_q.put_nowait(result)
             except queue.Full:
@@ -142,9 +163,3 @@ class Worker(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
-
-
-class _AlwaysSet:
-    """Drop-in for threading.Event that is always set (feature always enabled)."""
-    def is_set(self) -> bool:
-        return True

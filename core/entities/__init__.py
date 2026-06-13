@@ -1,2 +1,2 @@
-"""Domain entities: Track, SpeedEstimator."""
-from core.entities.track import Track, SpeedEstimator  # noqa: F401
+"""Domain entities."""
+from core.entities.vehicle import Vehicle  # noqa: F401

@@ -1,2 +1,2 @@
 """UI package."""
-from ui.app import SpeedAnalyzerModern  # noqa: F401
+from ui.app import LaneDistanceApp  # noqa: F401

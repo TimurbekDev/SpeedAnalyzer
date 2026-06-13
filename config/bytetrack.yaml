@@ -1,0 +1,12 @@
+# Custom ByteTrack config for the lane-distance app.
+# Tuned to reduce ID switches on road footage: a longer track_buffer keeps a
+# briefly-occluded vehicle's track alive so it is re-associated with the SAME id
+# instead of spawning a new one (which is what produced duplicate log rows).
+
+tracker_type: bytetrack
+track_high_thresh: 0.25  # first-stage match threshold
+track_low_thresh: 0.1    # second-stage threshold for low-score detections
+new_track_thresh: 0.25   # start a new track only if no match >= this
+track_buffer: 60         # keep lost tracks alive ~2 s @30 fps -> fewer ID switches
+match_thresh: 0.8        # association IoU/cost threshold
+fuse_score: True         # fuse detection score with motion/IoU for stabler matching
